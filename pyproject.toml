@@ -3,7 +3,7 @@ name = "sirius-compass-backend"
 version = "0.1.0"
 description = "Agentic AI platform to analyze projects and provide status."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 license = {text = "Proprietary"}
 authors = [
     {name = "Federico Martucci", email = "federicomartucci@sirius.com.ar"},
@@ -12,32 +12,31 @@ authors = [
 keywords = ["ai", "agents", "engineering-metrics", "rag", "hexagonal-architecture"]
 dependencies = [
     # Utilities
-    "python-dotenv>=1.0.0",       # Environment variables management (.env)
-    "pydantic>=2.5.0",            # Data validation and schemas (Domain Models)
-    "requests>=2.31.0",           # Generic HTTP requests
+    "python-dotenv>=1.2.1",       # Environment variables management (.env)
+    "pydantic>=2.12.5",            # Data validation and schemas (Domain Models)
+    "requests>=2.32.5",           # Generic HTTP requests
 
     # Core & Agents
-    "langchain>=0.1.0",               # Base framework
-    "langgraph>=0.0.10",              # Agent orchestration (Graphs)
-    "langchain-openai>=0.0.5",        # Connector for GPT-4o (optional/future)
-    "langchain-google-genai>=0.0.5",  # Connector for Gemini (your current choice)
+    "langchain>=1.1.3",               # Base framework
+    "langgraph>=1.0.4",              # Agent orchestration (Graphs)
+    "langchain-openai>=1.1.1",        # Connector for GPT-4o (optional/future)
+    "langchain-google-genai>=4.0.0",  # Connector for Gemini (current choice)
 
     # Vector Database (RAG)
-    "pinecone-client>=3.0.0",         # Official Pinecone client
-    "langchain-pinecone>=0.0.1",      # LangChain integration with Pinecone
+    "langchain-pinecone>=0.2.13",      # LangChain integration with Pinecone
 
     # Data Analytics & Visualization
-    "pandas>=2.0.0",              # Tabular data manipulation (Reports)
-    "matplotlib>=3.8.0",          # Static chart generation (images in chat)
-    "plotly>=5.18.0",             # Interactive charts
+    "pandas>=2.3.3",              # Tabular data manipulation (Reports)
+    "matplotlib>=3.10.7",          # Static chart generation (images in chat)
+    "plotly>=6.5.0",             # Interactive charts
 
     # Adapters
-    "PyGithub>=2.1.1",            # SDK to adapt GitHub
+    "PyGithub>=2.8.1",            # SDK to adapt GitHub
     # "py-trello"
 
     # Web Service
-    "fastapi>=0.109.0",
-    "uvicorn>=0.27.0"
+    "fastapi>=0.124.0",
+    "uvicorn>=0.38.0"
 ]
 
 [build-system]
@@ -48,3 +47,6 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["app*"]
+
+[tool.poetry]
+package-mode = false
