@@ -1,0 +1,50 @@
+[project]
+name = "sirius-compass-backend"
+version = "0.1.0"
+description = "Agentic AI platform to analyze projects and provide status."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Proprietary"}
+authors = [
+    {name = "Federico Martucci", email = "federicomartucci@sirius.com.ar"},
+    {name = "Santiago Alvarez", email = "santiagoalvarez@sirius.com.ar"}
+]
+keywords = ["ai", "agents", "engineering-metrics", "rag", "hexagonal-architecture"]
+dependencies = [
+    # Utilities
+    "python-dotenv>=1.0.0",       # Environment variables management (.env)
+    "pydantic>=2.5.0",            # Data validation and schemas (Domain Models)
+    "requests>=2.31.0",           # Generic HTTP requests
+
+    # Core & Agents
+    "langchain>=0.1.0",               # Base framework
+    "langgraph>=0.0.10",              # Agent orchestration (Graphs)
+    "langchain-openai>=0.0.5",        # Connector for GPT-4o (optional/future)
+    "langchain-google-genai>=0.0.5",  # Connector for Gemini (your current choice)
+
+    # Vector Database (RAG)
+    "pinecone-client>=3.0.0",         # Official Pinecone client
+    "langchain-pinecone>=0.0.1",      # LangChain integration with Pinecone
+
+    # Data Analytics & Visualization
+    "pandas>=2.0.0",              # Tabular data manipulation (Reports)
+    "matplotlib>=3.8.0",          # Static chart generation (images in chat)
+    "plotly>=5.18.0",             # Interactive charts
+
+    # Adapters
+    "PyGithub>=2.1.1",            # SDK to adapt GitHub
+    # "py-trello"
+
+    # Web Service
+    "fastapi>=0.109.0",
+    "uvicorn>=0.27.0"
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# Configuration to automatically discover source code
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
