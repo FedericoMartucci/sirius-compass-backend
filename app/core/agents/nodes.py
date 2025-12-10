@@ -1,6 +1,5 @@
 from datetime import datetime
 from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_core.prompts import ChatPromptTemplate
 from app.core.agents.state import GraphState
 from app.core.llm_factory import get_llm
 from app.core.models.domain import DeveloperReport
@@ -8,23 +7,25 @@ from app.core.rag.vector_store import search_similar_rules
 
 def analyze_activities_node(state: GraphState):
     """
-    Analyst Node: it takes raw activities (with code diffs) and asks the LLM to find patterns.
+    Analyst Node: Takes raw activities (with code diffs), retrieves Sirius Standards via RAG,
+    and asks the LLM to audit the code against those specific rules.
     """
-    print("Analyzing code patterns and diffs...")
+    print("🧠 Agent: Analyzing code patterns and diffs (Sirius Context Mode)...")
     
     activities = state["activities"]
     repo_name = state["repo_name"]
-    # We use a low temperature for objective technical analysis
+    
+    # Temperature 0 for strict objectivity
     llm = get_llm(temperature=0) 
     
-    # --- STEP 1: RAG RETRIEVAL ---
-    # We ask the DB for rules relevant to "code quality and git workflow"
-    # In a more advanced version, we could search based on the specific code content.
-    print("📚 Retrieving Sirius Engineering Standards...")
-    retrieved_rules = search_similar_rules("code quality language consistency git workflow", k=4)
-    
-    # --- STEP 2: PREPARE CONTEXT ---
+    # 1. RAG RETRIEVAL (Fetch Sirius Standards)
+    # We query for general quality, security, and git standards to have the full context
+    print("📚 Retrieving Sirius Engineering Standards from Pinecone...")
+    retrieved_rules = search_similar_rules("security credentials git commit style testing rules errors", k=8)
+
+    # 2. PREPARE CONTEXT (Raw Activity Data)
     context_text = ""
+    # We limit to 15 activities to fit context window while giving enough history
     for act in activities[:15]:
         context_text += f"""
         ---
@@ -35,63 +36,49 @@ def analyze_activities_node(state: GraphState):
         ---
         """
 
-    # --- STEP 3: PROMPT WITH RAG ---
+    # 3. DEFINE PROMPT (Sirius Tech Lead Persona)
     system_prompt = f"""
-    You are Sirius Compass, an uncompromising Senior Tech Lead.
+    You are Sirius Compass, a Senior Tech Lead at Sirius Software.
+    Your role is to audit code with a PRAGMATIC but SECURE mindset, strictly following internal culture.
     
-    REFERENCE STANDARDS (You must enforce these strictly):
+    INTERNAL SIRIUS STANDARDS (You must enforce these):
     {retrieved_rules}
     
-    INSTRUCTIONS:
-    Evaluate the developer's work based strictly on the standards above and general best practices.
-    Flag any violation immediately.
-    
-    OUTPUT FORMAT:
-    Provide a technical report in Spanish.
-    ... (resto del prompt igual) ...
-    """
-
-    # 1. Prepare Context (Summarize Diffs to fit context window efficiently)
-    # We prioritize the latest 15 activities for the MVP
-    context_text = ""
-    for act in activities[:15]:
-        context_text += f"""
-        ---
-        [Activity Type]: {act.type.value}
-        [Date]: {act.timestamp}
-        [Content/Diff Summary]: 
-        {act.content[:1500]} 
-        ---
-        """
-
-    # 2. Define the Prompt (Strict Auditor Persona)
-    system_prompt = """
-    You are Sirius Compass, an uncompromising Senior Tech Lead and Code Auditor.
-    Your goal is to perform a CRITICAL code review. Do not sugarcoat your findings.
-    
-    You must evaluate the developer's work against the "Sirius Engineering Standards":
-    
-    1. LANGUAGE CONSISTENCY: The codebase (variables, functions, comments) MUST be 100% in English. 
-       - If you detect Spanish comments or Spanglish, FLAG IT immediately as a critical issue.
+    AUDIT GUIDELINES:
+    1. SECURITY IS NON-NEGOTIABLE[cite: 100]:
+       - Flag IMMEDIATELY any committed .env, API Key, or secret. This is a critical failure.
+       - Flag any logging of PII (passwords, emails).
        
-    2. REPOSITORY HYGIENE: 
-       - Committing test files (e.g., 'test_models.py') inside the main application logic is forbidden.
-       - Temporary files or junk code must not be committed.
+    2. LANGUAGE & CONSISTENCY[cite: 4]:
+       - Detect the dominant language of the repo (English or Spanish).
+       - Flag "Spanglish" (mixing languages in variables/files) as a Code Smell.
+       - If the repo is in Spanish (LATAM client), Spanish variable names are ACCEPTABLE. Do not flag them unless mixed with English.
        
-    3. ATOMICITY: Commits should solve one thing. Giant commits or vague messages like "changes" are bad practices.
-    
-    OUTPUT FORMAT:
-    Provide a technical report in Spanish.
-    - Start with a "Calidad Técnica" score (1-10) based on your strict assessment.
-    - List "Puntos Fuertes" (briefly).
-    - List "Áreas de Mejora" (be very specific about files and lines if possible).
-    - End with a "Veredicto" (Junior, Semi-Senior, Senior) based solely on the evidence.
+    3. GIT & WORKFLOW[cite: 27]:
+       - "Mega-Commits" (many files changed, vague message) are a yellow card.
+       - Conventional Commits (feat:, fix:) are desired.
+       
+    4. TESTING & PRAGMATISM[cite: 46]:
+       - If a commit message says "HOTFIX" or "URGENT", accept lack of tests but add a warning to add them later.
+       - For normal features, complain if there are NO tests or if error handling is swallowed (empty catch blocks).
+       
+    5. PROFILE[cite: 128]:
+       - Value "Self-documenting code" over excessive comments.
+       - We prefer "Move fast, but don't break things". Do not be a purist about minor style issues if the code is solid and secure.
+
+    OUTPUT FORMAT (In Spanish):
+    - **Score de Calidad (1-10)**: Be strict on security, flexible on style.
+    - **Alerta de Seguridad**: (YES/NO) - Details if YES.
+    - **Análisis de Consistencia**: (Check for Spanglish).
+    - **Puntos Fuertes**: (e.g. Atomic commits, good error handling).
+    - **A mejorar**: (Specific files/lines).
+    - **Veredicto**: (Ready to Merge / Needs Work / Blocked).
     """
 
     user_prompt = f"""
     Repository: {repo_name}
     
-    Analyze the following activity log:
+    Raw Activity Log:
     {context_text}
     """
 
@@ -100,36 +87,32 @@ def analyze_activities_node(state: GraphState):
         HumanMessage(content=user_prompt)
     ]
     
-    # 3. Invoke LLM
+    # 4. Invoke LLM
     response = llm.invoke(messages)
     
-    # 4. Update State (Append the analysis to the logs)
+    # 5. Update State
     return {"analysis_logs": [response.content]}
-
 
 def generate_report_node(state: GraphState):
     """
     Reporter Node: Synthesizes the analysis into the final structured object.
+    (Mocking data for MVP flow until we implement Structured Output)
     """
     print("📝 Agent: Generating structured report...")
     
     developer_name = state["developer_name"]
     analysis_text = "\n".join(state["analysis_logs"])
     
-    # In a real scenario, we would use 'with_structured_output' (Pydantic) 
-    # but for this MVP step, we will mock the object creation based on the text 
-    # to keep it simple, or use a second LLM call to structure it.
-    
-    # Let's do a basic mapping for the MVP
+    # Placeholder report logic for MVP
     report = DeveloperReport(
         developer_name=developer_name,
-        period_start=datetime.now(), # Placeholder
+        period_start=datetime.now(),
         period_end=datetime.now(),
-        tasks_completed=0, # We would calculate this from Trello adapter later
+        tasks_completed=0,
         prs_merged=len([a for a in state["activities"] if "MERGE" in a.type.value]),
-        quality_score=8, # Placeholder: In next steps we ask LLM to output this number
-        feedback_summary=analysis_text, # The raw analysis from the previous node
-        detected_skills=["Python", "Git", "Hexagonal Arch"] # Placeholder
+        quality_score=0, # The score is currently embedded in the text analysis
+        feedback_summary=analysis_text,
+        detected_skills=["Python", "LangGraph", "RAG"] # Placeholder
     )
     
     return {"final_report": report}
