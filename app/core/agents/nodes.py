@@ -4,6 +4,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from app.core.agents.state import GraphState
 from app.core.llm_factory import get_llm
 from app.core.models.domain import DeveloperReport
+from app.core.rag.vector_store import search_similar_rules
 
 def analyze_activities_node(state: GraphState):
     """
@@ -14,8 +15,42 @@ def analyze_activities_node(state: GraphState):
     activities = state["activities"]
     repo_name = state["repo_name"]
     # We use a low temperature for objective technical analysis
-    llm = get_llm(temperature=0.2) 
+    llm = get_llm(temperature=0) 
     
+    # --- STEP 1: RAG RETRIEVAL ---
+    # We ask the DB for rules relevant to "code quality and git workflow"
+    # In a more advanced version, we could search based on the specific code content.
+    print("📚 Retrieving Sirius Engineering Standards...")
+    retrieved_rules = search_similar_rules("code quality language consistency git workflow", k=4)
+    
+    # --- STEP 2: PREPARE CONTEXT ---
+    context_text = ""
+    for act in activities[:15]:
+        context_text += f"""
+        ---
+        [Activity Type]: {act.type.value}
+        [Date]: {act.timestamp}
+        [Content/Diff Summary]: 
+        {act.content[:2000]} 
+        ---
+        """
+
+    # --- STEP 3: PROMPT WITH RAG ---
+    system_prompt = f"""
+    You are Sirius Compass, an uncompromising Senior Tech Lead.
+    
+    REFERENCE STANDARDS (You must enforce these strictly):
+    {retrieved_rules}
+    
+    INSTRUCTIONS:
+    Evaluate the developer's work based strictly on the standards above and general best practices.
+    Flag any violation immediately.
+    
+    OUTPUT FORMAT:
+    Provide a technical report in Spanish.
+    ... (resto del prompt igual) ...
+    """
+
     # 1. Prepare Context (Summarize Diffs to fit context window efficiently)
     # We prioritize the latest 15 activities for the MVP
     context_text = ""
