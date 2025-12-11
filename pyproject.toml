@@ -36,7 +36,8 @@ dependencies = [
 
     # Web Service
     "fastapi>=0.124.0",
-    "uvicorn>=0.38.0"
+    "uvicorn>=0.38.0",
+    "sqlmodel (>=0.0.27,<0.0.28)"
 ]
 
 [build-system]

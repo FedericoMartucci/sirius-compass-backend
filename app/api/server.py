@@ -1,15 +1,25 @@
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from contextlib import asynccontextmanager
 from app.api.schemas import AnalyzeRequest, AnalyzeResponse
 from app.adapters.github.adapter import GitHubAdapter
 from app.core.agents.builder import build_sirius_graph
+from app.core.database.session import create_db_and_tables
 from app.core.logger import get_logger
 
 load_dotenv()
 
 logger = get_logger(__name__)
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # On Startup
+    create_db_and_tables()
+    yield
+    # On Shutdown
+
 app = FastAPI(
+    lifespan=lifespan,
     title="Sirius Compass API",
     description="Engineering Intelligence Platform Backend",
     version="1.0.0"
