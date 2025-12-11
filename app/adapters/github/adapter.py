@@ -4,6 +4,9 @@ from datetime import datetime, timedelta, timezone
 from github import Github, GithubException
 from app.ports.code_provider import CodeProvider
 from app.core.models.domain import UnifiedActivity, ActivityType
+from app.core.logger import get_logger
+
+logger = get_logger(__name__)
 
 class GitHubAdapter(CodeProvider):
     """
@@ -42,7 +45,7 @@ class GitHubAdapter(CodeProvider):
         return "\n\n".join(diff_summary)
 
     def fetch_recent_activity(self, repo_name: str, days: int = 7) -> List[UnifiedActivity]:
-        print(f"Connecting to GitHub Repo: {repo_name}...")
+        logger.info(f"Connecting to GitHub Repo: {repo_name}...")
         activities = []
         try:
             repo = self.client.get_repo(repo_name)
@@ -89,12 +92,12 @@ class GitHubAdapter(CodeProvider):
                 )
                 activities.append(activity)
 
-            print(f"Found {len(activities)} activities in {repo_name}")
+            logger.info(f"Found {len(activities)} activities in {repo_name}")
             return activities
 
         except GithubException as e:
-            print(f"GitHub API Error: {e.data.get('message', e)}")
+            logger.error(f"GitHub API Error: {e.data.get('message', e)}")
             return []
         except Exception as e:
-            print(f"Unexpected Error: {e}")
+            logger.error(f"Unexpected Error: {e}")
             return []
