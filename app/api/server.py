@@ -83,5 +83,3 @@ async def analyze_repository(request: AnalyzeRequest):
     except Exception as e:
         logger.error(f"API Error: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
-
-# To run: poetry run uvicorn app.api.server:app --reload

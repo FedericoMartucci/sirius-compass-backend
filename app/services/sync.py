@@ -1,0 +1,89 @@
+from datetime import datetime, timezone
+from sqlmodel import Session, select
+from app.core.database.models import Repository, Activity
+from app.adapters.github.adapter import GitHubAdapter
+from app.core.logger import get_logger
+
+logger = get_logger(__name__)
+
+class SyncService:
+    def __init__(self, session: Session):
+        self.session = session
+        self.github = GitHubAdapter()
+
+    def ensure_repository_sync(self, repo_url: str, days_lookback: int = 7):
+        """
+        Smart Sync Logic:
+        1. Check when we last synced this repo.
+        2. If never synced, fetch 'days_lookback'.
+        3. If synced recently, only fetch the DELTA (from last_sync to now).
+        """
+        # 1. Find or Create Repository Entry
+        repo = self.session.exec(select(Repository).where(Repository.url == repo_url)).first()
+        
+        if not repo:
+            logger.info(f"🆕 New Repository detected: {repo_url}")
+            repo_name = repo_url.replace("https://github.com/", "").strip("/")
+            repo = Repository(url=repo_url, name=repo_name, last_synced_at=None)
+            self.session.add(repo)
+            self.session.commit()
+            self.session.refresh(repo)
+
+        # 2. Determine Time Window
+        now = datetime.now(timezone.utc)
+        
+        if repo.last_synced_at:
+            # Incremental Update: Fetch only what's new since last sync
+            # Add a small buffer (e.g., 1 min) to avoid missing overlapping commits
+            since_date = repo.last_synced_at
+            logger.info(f"🔄 Incremental Sync for {repo.name} since {since_date}")
+            
+            # Optimization: If last sync was < 5 minutes ago, skip GitHub call entirely
+            time_diff = (now - repo.last_synced_at).total_seconds()
+            if time_diff < 300: 
+                logger.info("⚡ Repo is fresh (synced < 5 mins ago). Skipping GitHub.")
+                return repo
+        else:
+            # Full Initial Sync
+            logger.info(f"📥 Initial Sync for {repo.name} ({days_lookback} days)")
+            # Calculate date manually for adapter API
+            from datetime import timedelta
+            since_date = now - timedelta(days=days_lookback)
+
+        # 3. Fetch from Adapter
+        # Note: We need to update the adapter to accept a specific 'since_date' datetime object
+        # instead of just 'int days'. (We will assume adapter handles this logic).
+        # Calculating days for the current adapter signature:
+        days_delta = (now - since_date).days + 1
+        
+        raw_activities = self.github.fetch_recent_activity(repo.name, days=days_delta)
+
+        # 4. Save to DB (Upsert - Avoid Duplicates)
+        new_count = 0
+        for act in raw_activities:
+            # Check if exists by source_id (SHA)
+            exists = self.session.exec(
+                select(Activity).where(Activity.source_id == act.source_id)
+            ).first()
+            
+            if not exists:
+                db_activity = Activity(
+                    repository_id=repo.id,
+                    source_id=act.source_id,
+                    type=act.type.value,
+                    author=act.author,
+                    timestamp=act.timestamp,
+                    title=act.content.split('\n')[0][:200], # First line as title
+                    content=act.content, # The Diff
+                    files_changed_count=len(act.files_changed)
+                )
+                self.session.add(db_activity)
+                new_count += 1
+        
+        # 5. Update Metadata
+        repo.last_synced_at = now
+        self.session.add(repo)
+        self.session.commit()
+        
+        logger.info(f"✅ Sync Complete. Added {new_count} new activities.")
+        return repo
