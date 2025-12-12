@@ -1,7 +1,9 @@
+import os
 from datetime import datetime, timezone
 from sqlmodel import Session, select
-from app.core.database.models import Repository, Activity
+from app.adapters.linear.adapter import LinearAdapter
 from app.adapters.github.adapter import GitHubAdapter
+from app.core.database.models import Repository, Activity
 from app.core.logger import get_logger
 
 logger = get_logger(__name__)
@@ -10,6 +12,52 @@ class SyncService:
     def __init__(self, session: Session):
         self.session = session
         self.github = GitHubAdapter()
+        self.linear = LinearAdapter()
+
+    def sync_linear_issues(self, repo_db: Repository):
+        """
+        Ingests tickets from Linear.
+        """
+        if not self.linear._enabled: return
+
+        # Optional: Filter by team key if defined in env
+        team_key_filter = os.getenv("LINEAR_TEAM_KEY") 
+        logger.info(f"🔄 Syncing Linear Tickets...")
+        
+        issues = self.linear.fetch_recent_issues(team_key=team_key_filter)
+
+        new_count = 0
+        for issue in issues:
+            exists = self.session.exec(
+                select(Activity).where(
+                    Activity.source_id == issue.id, 
+                    Activity.source_platform == "linear"
+                )
+            ).first()
+
+            if not exists:
+                try:
+                    dt = datetime.fromisoformat(issue.createdAt.replace('Z', '+00:00'))
+                except ValueError:
+                    dt = datetime.now(timezone.utc)
+
+                db_activity = Activity(
+                    repository_id=repo_db.id,
+                    source_platform="linear",
+                    source_id=issue.id,
+                    type="TICKET",
+                    author="LinearUser",
+                    timestamp=dt,
+                    title=issue.title,
+                    content=issue.description or "",
+                    story_points=issue.estimate, # Storing the metric!
+                    status_label=issue.state
+                )
+                self.session.add(db_activity)
+                new_count += 1
+        
+        self.session.commit()
+        logger.info(f"✅ Synced {new_count} new tickets from Linear.")
 
     def ensure_repository_sync(self, repo_url: str, days_lookback: int = 7):
         """
@@ -28,6 +76,9 @@ class SyncService:
             self.session.add(repo)
             self.session.commit()
             self.session.refresh(repo)
+            pass
+
+        self.sync_linear_issues(repo)
 
         # 2. Determine Time Window
         now = datetime.now(timezone.utc)
