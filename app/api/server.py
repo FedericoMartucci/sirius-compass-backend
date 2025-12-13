@@ -1,23 +1,43 @@
-from fastapi import FastAPI, HTTPException, Depends
+# app/api/server.py
+import os
+from urllib.parse import urlparse
+from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
-from sqlmodel import Session
 from contextlib import asynccontextmanager
 
-# Import Internal Modules
-from app.api.schemas import AnalyzeRequest, AnalyzeResponse
-from app.core.database.session import create_db_and_tables, get_session
-from app.services.sync import SyncService
-from app.core.agents.builder import build_sirius_graph
-from app.core.models.domain import UnifiedActivity, ActivityType
+# Import Schemas from your existing file
+from app.api.schemas import AnalyzeRequest, AnalyzeResponse, ChatRequest
+
+from app.core.database.session import create_db_and_tables
+from app.core.agents.analyst_graph import build_analyst_graph
+from app.core.agents.chat_graph import build_chat_graph
 from app.core.logger import get_logger
 
-# 1. Load environment variables first!
-load_dotenv() 
-
+load_dotenv()
 logger = get_logger(__name__)
 
-# Lifespan event to initialize the DB on startup
+# --- Helper: Robust URL Parsing (Kept here as internal util) ---
+def _parse_repo_name(url_str: str) -> str:
+    """
+    Extracts 'owner/repo' safely from URL.
+    """
+    clean_url = url_str.strip().rstrip("/")
+    if not clean_url.startswith("http") and "/" in clean_url:
+        parts = clean_url.split("/")
+        if len(parts) == 2: return f"{parts[0]}/{parts[1]}"
+            
+    try:
+        parsed = urlparse(clean_url)
+        path = parsed.path.strip("/")
+        if path.endswith(".git"): path = path[:-4]
+        parts = path.split("/")
+        if len(parts) < 2: raise ValueError("URL path too short")
+        return f"{parts[-2]}/{parts[-1]}"
+    except Exception:
+        raise ValueError(f"Could not parse repository name from: {url_str}")
+
+# --- Lifespan ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🏁 System Startup: Initializing Database...")
@@ -25,106 +45,80 @@ async def lifespan(app: FastAPI):
     yield
     logger.info("🛑 System Shutdown")
 
-app = FastAPI(
-    title="Sirius Compass API",
-    description="Engineering Intelligence Platform Backend",
-    version="1.0.0",
-    lifespan=lifespan
-)
+app = FastAPI(title="Sirius Compass API", lifespan=lifespan)
 
-# 2. Mount Static Files (For Charts/Multimodality)
+# --- Static Files ---
+if not os.path.exists("static"): os.makedirs("static")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-@app.get("/health")
-async def health_check():
-    return {"status": "ok", "service": "sirius-compass"}
-
+# --- Endpoint 1: ANALYST (Batch) ---
 @app.post("/analyze", response_model=AnalyzeResponse)
-async def analyze_repository(
-    request: AnalyzeRequest, 
-    session: Session = Depends(get_session) # Inject DB Session
-):
+async def analyze_repo(request: AnalyzeRequest):
     """
-    Triggers the analysis workflow.
-    Architecture: API -> SyncService -> DB (Store) -> DB (Read) -> Agent -> Response
+    Triggers the heavy analysis graph (GitHub + Linear -> Report -> DB).
     """
-    logger.info(f"🚀 API Request: Analyze {request.repo_url}")
+    logger.info(f"🚀 Starting Analysis for {request.repo_url} (Lookback: {request.lookback_days} days)")
     
     try:
         # 1. Parse Repo Name
-        parts = request.repo_url.rstrip("/").split("/")
-        if len(parts) < 2:
-            raise HTTPException(status_code=400, detail="Invalid GitHub URL")
-        repo_name = f"{parts[-2]}/{parts[-1]}"
+        repo_name = _parse_repo_name(request.repo_url)
         
-        # 2. Smart Sync (Data Lake Ingestion)
-        # This handles GitHub + Linear (if configured)
-        sync_service = SyncService(session)
-        logger.info(f"🔄 Syncing repository data for {repo_name}...")
-        repo_db = sync_service.ensure_repository_sync(request.repo_url, request.lookback_days)
+        # 2. Build Graph
+        workflow = build_analyst_graph()
         
-        # 3. Retrieve Data from DB (Local Access)
-        db_activities = repo_db.activities
-        
-        if not db_activities:
-            return {
-                "status": "warning", 
-                "report": {}, 
-                "metadata": {"message": "No activity found in database after sync"}
-            }
-
-        # 4. Map SQL Models -> Domain Models (for the Agent)
-        domain_activities = []
-        for db_act in db_activities:
-            # We map only what the Agent needs for code analysis
-            # (Linear tickets might be skipped here if the Agent focuses only on code, 
-            # or included if we want to compare Ticket vs Code)
-            try:
-                domain_act = UnifiedActivity(
-                    source_id=db_act.source_id,
-                    source_platform=db_act.source_platform,
-                    type=ActivityType(db_act.type) if db_act.type in ActivityType.__members__ else ActivityType.COMMIT, 
-                    author=db_act.author,
-                    content=db_act.content,
-                    timestamp=db_act.timestamp,
-                    url=f"{request.repo_url}/blob/main/{db_act.source_id}", 
-                    files_changed=[] 
-                )
-                domain_activities.append(domain_act)
-            except ValueError:
-                # Fallback for types not in the Enum (like TICKET)
-                pass
-
-        # Sort by timestamp desc
-        domain_activities.sort(key=lambda x: x.timestamp, reverse=True)
-
-        # 5. Execute Agent Workflow (Core)
+        # 3. Initial State
         initial_state = {
             "repo_name": repo_name,
             "developer_name": request.developer_name,
-            "activities": domain_activities,
+            "lookback_days": request.lookback_days,
+            "activities": [],
             "analysis_logs": [],
             "final_report": None
         }
         
-        workflow = build_sirius_graph()
-        result = workflow.invoke(initial_state)
+        # 4. Invoke
+        result = await workflow.ainvoke(initial_state)
+        report = result.get("final_report")
         
-        final_report = result.get("final_report")
-        report_data = final_report.dict() if final_report else {}
-
-        return {
-            "status": "success",
-            "report": report_data,
-            "metadata": {
-                "activities_processed": len(domain_activities),
-                "source": "database_cache"
-            }
-        }
-
+        # Construct Response using Schema
+        return AnalyzeResponse(
+            status="success",
+            message="Analysis complete and saved to DB.",
+            report_summary=report.feedback_summary if report else "No report generated.",
+            report=report.dict() if report else {}, # Fallback
+            metadata={"repo": repo_name}
+        )
+        
     except ValueError as ve:
-        logger.error(f"Validation Error: {ve}")
+        logger.error(f"Input Error: {ve}")
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
-        logger.error(f"API Error: {e}")
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+        logger.error(f"Analysis Failed: {e}")
+        # Return generic error but log full trace
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
+
+# --- Endpoint 2: CHAT (Interactive) ---
+@app.post("/chat")
+async def chat_agent(request: ChatRequest):
+    """
+    Talks to the Conversational Graph.
+    """
+    try:
+        workflow = build_chat_graph()
+        config = {"configurable": {"thread_id": request.thread_id}}
+        
+        # Inject Context into User Message
+        input_message = {
+            "messages": [("user", f"[Context: Repo {request.repo_name}] {request.message}")]
+        }
+        
+        result = await workflow.ainvoke(input_message, config=config)
+        last_message = result["messages"][-1]
+        
+        return {
+            "response": last_message.content,
+            "thread_id": request.thread_id
+        }
+    except Exception as e:
+        logger.error(f"Chat Failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

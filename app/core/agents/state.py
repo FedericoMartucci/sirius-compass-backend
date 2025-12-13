@@ -1,18 +1,25 @@
 import operator
 from typing import List, Annotated, Optional, TypedDict
+from langgraph.graph.message import add_messages
 from app.core.models.domain import UnifiedActivity, DeveloperReport
 
 class GraphState(TypedDict):
     """
-    Represents the shared memory of the agent workflow.
-    LangGraph passes this dictionary between nodes.
+    State for the Analyst Graph (Batch Process).
     """
     repo_name: str
     developer_name: str
-    activities: List[UnifiedActivity]  # The raw data from GitHub/Trello
-
-    # Internal Memory
-    analysis_logs: Annotated[List[str], operator.add]
+    lookback_days: int
     
-    # Outputs
+    # 'operator.add' allows parallel nodes to append to this list instead of overwriting
+    activities: Annotated[List[UnifiedActivity], operator.add]
+    
+    analysis_logs: Annotated[List[str], operator.add]
     final_report: Optional[DeveloperReport]
+
+class ChatState(TypedDict):
+    """
+    State for the Chat Graph (Conversational Process).
+    Stores message history.
+    """
+    messages: Annotated[list, add_messages]

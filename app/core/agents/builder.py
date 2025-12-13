@@ -1,11 +1,11 @@
 from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
 from app.core.agents.state import GraphState
 from app.core.agents.nodes import analyze_activities_node, generate_report_node
 
 def build_sirius_graph():
     """
-    Constructs the LangGraph workflow.
-    Flow: Start -> Analyze -> Report -> End
+    Constructs the LangGraph workflow with persistence.
     """
     # 1. Initialize the Graph with our typed State
     workflow = StateGraph(GraphState)
@@ -19,6 +19,9 @@ def build_sirius_graph():
     workflow.add_edge("analyst", "reporter") # Go to reporter
     workflow.add_edge("reporter", END) # Finish
 
-    # 4. Compile (Freeze the graph)
-    app = workflow.compile()
+    # 4. Setup Persistence with MemorySaver
+    memory = MemorySaver()
+
+    # 5. Compile with checkpointer
+    app = workflow.compile(checkpointer=memory)
     return app

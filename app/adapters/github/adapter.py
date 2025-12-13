@@ -1,19 +1,17 @@
-# app/adapters/github/adapter.py
 import os
 import concurrent.futures
 from typing import List, Any
 from datetime import datetime, timedelta, timezone
 from github import Github, GithubException
-from app.ports.code_provider import CodeProvider
 from app.core.models.domain import UnifiedActivity, ActivityType
 from app.core.logger import get_logger
 
 logger = get_logger(__name__)
 
-class GitHubAdapter(CodeProvider):
+class GitHubAdapter:
     """
-    Concrete implementation of CodeProvider for GitHub.
-    Optimized with ThreadPoolExecutor for parallel diff fetching.
+    Concrete implementation for GitHub.
+    Fetches ALL activity within the lookback window to populate the Data Lake (DB).
     """
 
     def __init__(self):
@@ -25,93 +23,106 @@ class GitHubAdapter(CodeProvider):
 
     def _get_file_patch(self, file: Any) -> str:
         """
-        Helper function to fetch a single file's patch.
-        Designed to be run in a thread.
+        Helper to fetch a single file's patch safely.
         """
         try:
-            # Skip binary/lock files to reduce noise and latency
             if file.filename.endswith(('.lock', '.png', '.jpg', 'package-lock.json', '.pyc')):
                 return ""
             
-            patch = file.patch if file.patch else "[Binary or Large File]"
-            
-            # Truncate large patches to avoid token overflow
+            patch = file.patch if file.patch else "[Binary/Large]"
             if len(patch) > 2000:
                 patch = patch[:2000] + "\n... (truncated)"
             
             return f"File: {file.filename}\nChanges:\n{patch}"
-        except Exception as e:
-            logger.warning(f"Failed to fetch patch for {file.filename}: {e}")
+        except Exception:
             return ""
 
     def _extract_diff_parallel(self, files_object, max_workers: int = 5) -> str:
         """
-        Fetches file patches in PARALLEL to reduce latency.
+        Fetches file patches in PARALLEL.
         """
-        # Convert paginated list to a standard list (limit to first 10 files for performance)
-        files_list = list(files_object[:10])
-        
+        # Limit to first 5 files to avoid huge payloads
+        files_list = list(files_object[:5])
         diff_summary = []
         
-        # Parallel Execution
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit tasks
             future_to_file = {executor.submit(self._get_file_patch, f): f for f in files_list}
-            
             for future in concurrent.futures.as_completed(future_to_file):
-                result = future.result()
-                if result:
+                if result := future.result():
                     diff_summary.append(result)
                     
         return "\n\n".join(diff_summary)
 
-    def fetch_recent_activity(self, repo_name: str, days: int = 7) -> List[UnifiedActivity]:
-        logger.info(f"📡 Connecting to GitHub Repo: {repo_name} (Parallel Mode)...")
+    def fetch_recent_activity(self, repo_name: str, days: int = 90) -> List[UnifiedActivity]:
+        """
+        Fetches commits and PRs. 
+        NOTE: 'days' should be large (e.g., 720 or 1100) for legacy projects.
+        """
+        logger.info(f"📡 Connecting to GitHub Repo: {repo_name} (Lookback: {days} days)...")
         activities = []
+        
         try:
             repo = self.client.get_repo(repo_name)
+            
+            # Ensure timezone-aware datetime
             since_date = datetime.now(timezone.utc) - timedelta(days=days)
+            logger.info(f"📅 Fetching items since: {since_date.date()}")
 
             # --- 1. Fetch Commits ---
-            # Note: Pagination in PyGithub is lazy. 
-            # We iterate and break manually to avoid fetching full history.
-            commits = repo.get_commits(since=since_date)
+            # Explicitly use the default branch (main/master) to avoid detached head issues
+            default_branch = repo.default_branch
+            commits = repo.get_commits(since=since_date, sha=default_branch)
             
+            commit_count = 0
+            # We iterate without a hard limit on count, only date (controlled by API)
+            # But we add a safety ceiling (e.g. 500) to prevent infinite loops in massive repos
             for commit in commits:
-                # Optimized Parallel Diff Extraction
+                commit_count += 1
+                if commit_count > 300: # Safety ceiling for MVP
+                    logger.warning("⚠️ Hit safety limit of 300 commits. Stopping fetch.")
+                    break
+
+                # For very old commits, sometimes diffs are expensive. 
+                # We skip detailed diffs for commits older than 90 days to speed up legacy import
+                # unless it's critical. Here we fetch all.
                 diff_content = self._extract_diff_parallel(commit.files)
 
                 activity = UnifiedActivity(
                     source_id=commit.sha,
-                    author=commit.commit.author.name or "Unknown",
+                    source_platform="github",
                     type=ActivityType.COMMIT,
+                    author=commit.commit.author.name or "Unknown",
                     content=f"Message: {commit.commit.message}\n\nCode Diff:\n{diff_content}",
                     timestamp=commit.commit.author.date.replace(tzinfo=timezone.utc),
                     url=commit.html_url,
                     files_changed=[f.filename for f in commit.files[:5]]
                 )
                 activities.append(activity)
-                
-                # Safety break for MVP: Analyze max 15 latest commits to ensure speed
-                if len(activities) >= 15:
-                    break
 
             # --- 2. Fetch Pull Requests ---
             prs = repo.get_pulls(state='all', sort='updated', direction='desc')
+            pr_count = 0
+            
             for pr in prs:
-                if pr.updated_at.replace(tzinfo=timezone.utc) < since_date:
-                    break 
+                # Manual date check as PR API doesn't support 'since' well
+                pr_date = pr.updated_at.replace(tzinfo=timezone.utc)
+                if pr_date < since_date:
+                    if pr_count > 10: # Only break if we've seen a few old ones (buffer)
+                        break
+                    continue
                 
+                pr_count += 1
+                if pr_count > 100: break # Safety ceiling
+
                 type_pr = ActivityType.PR_MERGE if pr.merged else ActivityType.PR_OPEN
-                
-                # Optimized Parallel Diff Extraction for PRs
                 diff_content = self._extract_diff_parallel(pr.get_files())
 
                 activity = UnifiedActivity(
                     source_id=str(pr.number),
-                    author=pr.user.login,
+                    source_platform="github",
                     type=type_pr,
-                    content=f"Title: {pr.title}\nBody: {pr.body}\n\nCode Diff:\n{diff_content}",
+                    author=pr.user.login,
+                    content=f"Title: {pr.title}\nBody: {pr.body}\n\nDiff:\n{diff_content}",
                     timestamp=pr.created_at.replace(tzinfo=timezone.utc),
                     url=pr.html_url,
                     additions=pr.additions,
@@ -120,7 +131,7 @@ class GitHubAdapter(CodeProvider):
                 )
                 activities.append(activity)
 
-            logger.info(f"✅ Fetched {len(activities)} activities from {repo_name}")
+            logger.info(f"✅ Fetched {len(activities)} activities ({commit_count} commits, {pr_count} PRs)")
             return activities
 
         except GithubException as e:
