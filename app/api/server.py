@@ -547,18 +547,18 @@ def list_reports(project_name: Optional[str] = Query(default=None), limit: int =
             repo = session.get(Repository, r.repository_id)
             repo_name = repo.name if repo else "unknown"
 
+            # Resolve project association
+            link = session.exec(
+                select(ProjectRepository).where(ProjectRepository.repository_id == r.repository_id)
+            ).first()
+            
             project_label = "unknown"
-            if project_name:
-                project_label = project_name
-            else:
-                link = session.exec(
-                    select(ProjectRepository).where(ProjectRepository.repository_id == r.repository_id)
-                ).first()
-                if link:
-                    project = session.get(Project, link.project_id)
-                    if project:
-                        project_label = project.name
+            if link:
+                project = session.get(Project, link.project_id)
+                if project:
+                    project_label = project.name
 
+            # Filter by project_name if provided
             if project_name and project_label != project_name:
                 continue
 
@@ -573,9 +573,12 @@ def list_reports(project_name: Optional[str] = Query(default=None), limit: int =
             elif r.quality_score <= 3:
                 status = "at-risk"
 
-            summary = (r.feedback_summary or "").strip().replace("\n", " ")
-            if len(summary) > 120:
-                summary = summary[:120] + "..."
+            # summary = (r.feedback_summary or "").strip().replace("\n", " ")
+            # if len(summary) > 120:
+            #     summary = summary[:120] + "..."
+            
+            # Use full summary without truncation
+            summary = (r.feedback_summary or "").strip()
 
             reports.append(
                 ReportDTO(
@@ -590,3 +593,65 @@ def list_reports(project_name: Optional[str] = Query(default=None), limit: int =
             )
 
         return reports
+
+
+@app.delete("/reports/{report_id}")
+def delete_report(report_id: int):
+    with Session(engine) as session:
+        report = session.get(AnalysisReport, report_id)
+        if not report:
+            raise HTTPException(status_code=404, detail="Report not found")
+        session.delete(report)
+        session.commit()
+        return {"status": "success", "message": "Report deleted"}
+
+
+@app.delete("/connections/{connection_id}")
+def delete_connection(connection_id: int, type: str = Query(..., description="Type of connection: 'Repository' or 'Board'")):
+    with Session(engine) as session:
+        if type.lower() == "repository":
+            # Find any project links to this repo and remove them
+            links = session.exec(select(ProjectRepository).where(ProjectRepository.repository_id == connection_id)).all()
+            if not links:
+                raise HTTPException(status_code=404, detail="Connection not found")
+            for link in links:
+                session.delete(link)
+            session.commit()
+            return {"status": "success", "message": "Repository connection removed"}
+            
+        elif type.lower() == "board":
+            # Handle synthetic IDs or missing integration records
+            project_id = None
+            integration = session.get(ProjectIntegration, connection_id)
+            
+            if integration:
+                project_id = integration.project_id
+                session.delete(integration)
+            elif connection_id >= 1000000:
+                # Fallback for synthetic IDs generated in list_connections
+                project_id = connection_id - 1000000
+                # Try to find integration by project_id just in case
+                integration = session.exec(select(ProjectIntegration).where(
+                    ProjectIntegration.project_id == project_id,
+                    ProjectIntegration.provider == "linear"
+                )).first()
+                if integration:
+                    session.delete(integration)
+            
+            if not project_id:
+                 raise HTTPException(status_code=404, detail="Connection not found")
+
+            # Also delete tickets to ensure it disappears from the list (which shows ghost connections if tickets exist)
+            tickets = session.exec(select(Ticket).where(
+                Ticket.project_id == project_id,
+                Ticket.source_platform == "linear"
+            )).all()
+            
+            for t in tickets:
+                session.delete(t)
+
+            session.commit()
+            return {"status": "success", "message": "Board connection removed"}
+            
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown connection type: {type}")
