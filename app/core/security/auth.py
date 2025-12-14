@@ -106,7 +106,7 @@ def verify_token(token: str) -> dict:
     except Exception as e:
         logger.error(f"Unexpected error during token verification: {e}")
         raise AuthError(
-            {"code": "verification_failed", "description": str(e)},
+            {"code": "verification_failed", "description": "Token verification failed due to an internal error"},
             status.HTTP_401_UNAUTHORIZED
         )
 
