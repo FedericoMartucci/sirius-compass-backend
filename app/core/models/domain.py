@@ -42,6 +42,7 @@ class UnifiedActivity(BaseModel):
     source_platform: str = "github" # Default to github, overwrite for linear
     type: ActivityType
     author: str
+    title: Optional[str] = None
     content: str
     related_task_id: Optional[str] = None
     timestamp: datetime
@@ -49,6 +50,9 @@ class UnifiedActivity(BaseModel):
     additions: int = 0
     deletions: int = 0
     files_changed: List[str] = Field(default_factory=list)
+    story_points: int = 0
+    status_label: Optional[str] = None
+    external_key: Optional[str] = None
 
 class DeveloperReport(BaseModel):
     developer_name: str

@@ -8,8 +8,10 @@ class GraphState(TypedDict):
     State for the Analyst Graph (Batch Process).
     """
     repo_name: str
+    project_name: str
     developer_name: str
     lookback_days: int
+    linear_team_key: Optional[str]
     
     # 'operator.add' allows parallel nodes to append to this list instead of overwriting
     activities: Annotated[List[UnifiedActivity], operator.add]

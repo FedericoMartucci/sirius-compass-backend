@@ -4,22 +4,24 @@ from langchain_core.language_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-LLMBuilder = Callable[[float], BaseChatModel]
+LLMBuilder = Callable[[float, bool], BaseChatModel]
 
-def _build_openai(temperature: float) -> BaseChatModel:
+def _build_openai(temperature: float, streaming: bool = False) -> BaseChatModel:
     """Builder for OpenAI (GPT) models."""
     print(f"Connecting with OpenAI...")
     return ChatOpenAI(
         model=os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini"),
-        temperature=temperature
+        temperature=temperature,
+        streaming=streaming,
     )
 
-def _build_gemini(temperature: float) -> BaseChatModel:
+def _build_gemini(temperature: float, streaming: bool = False) -> BaseChatModel:
     """Builder for Google Gemini models."""
     print(f"Connecting with Google Gemini...")
     return ChatGoogleGenerativeAI(
         model=os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash"),
         temperature=temperature,
+        streaming=streaming,
         convert_system_message_to_human=True
     )
 
@@ -29,7 +31,7 @@ _PROVIDER_REGISTRY: Dict[str, LLMBuilder] = {
 }
 
 
-def get_llm(temperature: float = 0) -> BaseChatModel:
+def get_llm(temperature: float = 0, streaming: bool = False) -> BaseChatModel:
     """
     Factory Pattern to instantiate the LLM using a dynamic registry.
     
@@ -47,4 +49,4 @@ def get_llm(temperature: float = 0) -> BaseChatModel:
         valid_keys = list(_PROVIDER_REGISTRY.keys())
         raise ValueError(f"Unsupported LLM provider: '{provider_key}'. Supported: {valid_keys}")
 
-    return builder(temperature)
+    return builder(temperature, streaming)

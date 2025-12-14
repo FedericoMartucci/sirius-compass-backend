@@ -7,6 +7,8 @@ engine = create_engine(sqlite_url, echo=False)
 
 def create_db_and_tables():
     """Initializes the database schema."""
+    # Ensure all SQLModel tables are registered before creating the schema.
+    import app.core.database.models  # noqa: F401
     SQLModel.metadata.create_all(engine)
 
 def get_session():
