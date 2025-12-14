@@ -509,10 +509,11 @@ def list_chat_threads(user_id: Optional[str] = Query(default=None)):
 
 @app.get("/chat/threads/{thread_id}/messages", response_model=List[ChatMessageDTO])
 def list_chat_messages(thread_id: str, limit: int = Query(default=100, ge=1, le=500)):
+    print(thread_id)
     with Session(engine) as session:
         thread = session.exec(select(ChatThread).where(ChatThread.external_thread_id == thread_id)).first()
         if not thread:
-            raise HTTPException(status_code=404, detail="Thread not found")
+            return []
 
         messages = session.exec(
             select(ChatMessage)

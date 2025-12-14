@@ -8,7 +8,9 @@ from app.core.llm_factory import get_llm
 from app.tools.db_reader import (
     get_developer_activity,
     get_developer_code_activity_by_project,
+    get_developer_recent_work,
     get_latest_audit_report,
+    get_project_developers,
 )
 
 def build_chat_graph():
@@ -16,7 +18,13 @@ def build_chat_graph():
     Interactive Chatbot with Granular DB Access.
     """
     # 1. Setup tools (includes get_developer_activity).
-    tools = [get_latest_audit_report, get_developer_activity, get_developer_code_activity_by_project]
+    tools = [
+        get_latest_audit_report,
+        get_developer_activity,
+        get_developer_code_activity_by_project,
+        get_developer_recent_work,
+        get_project_developers,
+    ]
     
     llm = get_llm(temperature=0, streaming=True).bind_tools(tools)
 
@@ -27,8 +35,13 @@ def build_chat_graph():
         
         CAPABILITIES:
         1. General Audit: Use 'get_latest_audit_report' for scores/summaries.
-        2. Specific Investigation: Use 'get_developer_activity' when asked about specific people/commits.
-        3. Project Scope Investigation: Use 'get_developer_code_activity_by_project' when a project has multiple repos.
+        2. Developer Commits: Use 'get_developer_activity' for a repo-scoped view.
+        3. Project Commits: Use 'get_developer_code_activity_by_project' for project-scoped commits across repos.
+        4. Commits + Tickets: Use 'get_developer_recent_work' when the user asks for commits AND related tickets.
+        5. Developers List: Use 'get_project_developers' when asked who is working on a project.
+
+        IMPORTANT:
+        - If the user asks "which tickets" (or similar), do NOT guess from branch names. Use 'get_developer_recent_work'.
         
         Try to answer the user's question directly using the data from the tools.
 
