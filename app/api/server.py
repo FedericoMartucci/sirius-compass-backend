@@ -7,7 +7,8 @@ from typing import List, Optional
 from fastapi import Request
 from fastapi.responses import StreamingResponse
 from urllib.parse import urlparse
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Depends, Query
+from fastapi.security import OAuth2PasswordBearer, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
@@ -32,6 +33,7 @@ from app.core.agents.analyst_graph import build_analyst_graph
 from app.core.agents.chat_graph import build_chat_graph
 from app.core.logger import get_logger
 from app.core.security.crypto import encrypt_secret
+from app.core.security.auth import get_current_user, get_user_id
 from app.core.streaming import TokenStreamHandler, sse_data
 from app.core.database.models import (
     AnalysisReport,
@@ -116,11 +118,15 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # --- Endpoint 1: ANALYST (Batch) ---
 @app.post("/analyze", response_model=AnalyzeResponse)
-async def analyze_repo(request: AnalyzeRequest):
+async def analyze_repo(
+    request: AnalyzeRequest,
+    user_id: str = Depends(get_user_id)
+):
     """
     Triggers the heavy analysis graph (GitHub + Linear -> Report -> DB).
+    Requires authentication - scoped to authenticated user.
     """
-    logger.info(f"🚀 Starting Analysis for {request.repo_url} (Lookback: {request.lookback_days} days)")
+    logger.info(f"🚀 Starting Analysis for {request.repo_url} (Lookback: {request.lookback_days} days) [User: {user_id}]")
     
     try:
         # 1. Parse Repo Name
@@ -130,14 +136,14 @@ async def analyze_repo(request: AnalyzeRequest):
         # 2. Build Graph
         workflow = build_analyst_graph()
         
-        # 3. Initial State
+        # 3. Initial State (use authenticated user_id)
         initial_state = {
             "repo_name": repo_name,
             "project_name": project_name,
             "developer_name": request.developer_name,
             "lookback_days": request.lookback_days,
             "linear_team_key": request.linear_team_key,
-            "user_id": request.user_id,
+            "user_id": user_id,
             "activities": [],
             "analysis_logs": [],
             "final_report": None
@@ -166,17 +172,23 @@ async def analyze_repo(request: AnalyzeRequest):
 
 # --- Endpoint 2: CHAT (Interactive) ---
 @app.post("/chat")
-async def chat_agent(payload: ChatRequest, http_request: Request):
+async def chat_agent(
+    payload: ChatRequest,
+    http_request: Request,
+    user_id: str = Depends(get_user_id)
+):
     """
     Talks to the Conversational Graph.
+    Requires authentication - scoped to authenticated user's threads.
     """
     try:
         project_name = payload.project_name or payload.repo_name
         with Session(engine) as session:
+            # Always use authenticated user_id for thread ownership
             thread = get_or_create_thread(
                 session,
                 external_thread_id=payload.thread_id,
-                owner_id=payload.user_id,
+                owner_id=user_id,
             )
             thread_db_id = thread.id
             history = load_thread_messages(session, thread_db_id, limit=50)
@@ -258,17 +270,36 @@ async def chat_agent(payload: ChatRequest, http_request: Request):
 
 # --- Endpoint 3: PROJECTS ---
 @app.get("/projects", response_model=List[ProjectDTO])
-def list_projects():
+def list_projects(user_id: str = Depends(get_user_id)):
+    """List projects owned by the authenticated user."""
     with Session(engine) as session:
-        projects = session.exec(select(Project).order_by(Project.updated_at.desc())).all()
+        # Scope to user's projects via ProjectRepository ownership
+        projects = session.exec(
+            select(Project)
+            .join(ProjectRepository, Project.id == ProjectRepository.project_id)
+            .join(Repository, ProjectRepository.repository_id == Repository.id)
+            .where(Repository.owner_id == user_id)
+            .order_by(Project.updated_at.desc())
+        ).all()
         return [ProjectDTO(id=str(p.id), name=p.name) for p in projects]
 
 
 @app.post("/projects", response_model=ProjectDTO)
-def create_project(payload: CreateProjectRequest):
+def create_project(
+    payload: CreateProjectRequest,
+    user_id: str = Depends(get_user_id)
+):
+    """Create a new project for the authenticated user."""
     name = payload.name.strip()
     with Session(engine) as session:
-        existing = session.exec(select(Project).where(Project.name == name)).first()
+        # Check for existing project owned by this user
+        existing = session.exec(
+            select(Project)
+            .join(ProjectRepository, Project.id == ProjectRepository.project_id)
+            .join(Repository, ProjectRepository.repository_id == Repository.id)
+            .where(Project.name == name)
+            .where(Repository.owner_id == user_id)
+        ).first()
         if existing:
             return ProjectDTO(id=str(existing.id), name=existing.name)
 
@@ -281,15 +312,27 @@ def create_project(payload: CreateProjectRequest):
 
 # --- Endpoint 4: CONNECTIONS (Integrations) ---
 @app.get("/connections", response_model=List[ConnectionDTO])
-def list_connections(project_name: Optional[str] = Query(default=None)):
+def list_connections(
+    project_name: Optional[str] = Query(default=None),
+    user_id: str = Depends(get_user_id)
+):
+    """List connections scoped to authenticated user's projects."""
     with Session(engine) as session:
         projects: List[Project] = []
+        # Only fetch projects that have repositories owned by this user
+        base_query = (
+            select(Project)
+            .join(ProjectRepository, Project.id == ProjectRepository.project_id)
+            .join(Repository, ProjectRepository.repository_id == Repository.id)
+            .where(Repository.owner_id == user_id)
+        )
+        
         if project_name:
-            project = session.exec(select(Project).where(Project.name == project_name)).first()
+            project = session.exec(base_query.where(Project.name == project_name)).first()
             if project:
                 projects = [project]
         else:
-            projects = session.exec(select(Project)).all()
+            projects = session.exec(base_query).all()
 
         connections: List[ConnectionDTO] = []
 
@@ -364,7 +407,11 @@ def list_connections(project_name: Optional[str] = Query(default=None)):
 
 
 @app.post("/connections", response_model=ConnectionDTO)
-def create_connection(payload: CreateConnectionRequest):
+def create_connection(
+    payload: CreateConnectionRequest,
+    user_id: str = Depends(get_user_id)
+):
+    """Create a connection for the authenticated user's project."""
     connection_type = payload.type.strip().lower()
     project_name = payload.project_name.strip()
 
@@ -381,9 +428,14 @@ def create_connection(payload: CreateConnectionRequest):
                 raise HTTPException(status_code=400, detail="repo_url is required for repository connections")
 
             repo_name = _parse_repo_name(payload.repo_url)
-            repo = session.exec(select(Repository).where(Repository.name == repo_name)).first()
+            # Check if user already has this repo
+            repo = session.exec(
+                select(Repository)
+                .where(Repository.name == repo_name)
+                .where(Repository.owner_id == user_id)
+            ).first()
             if not repo:
-                repo = Repository(url=payload.repo_url, name=repo_name)
+                repo = Repository(url=payload.repo_url, name=repo_name, owner_id=user_id)
                 session.add(repo)
                 session.commit()
                 session.refresh(repo)
@@ -400,14 +452,14 @@ def create_connection(payload: CreateConnectionRequest):
                 )
 
             # Optional: store GitHub token for the user (used by /analyze if configured).
-            if payload.github_token and payload.user_id:
+            if payload.github_token:
                 try:
                     encrypted = encrypt_secret(payload.github_token)
                 except ValueError as e:
                     raise HTTPException(status_code=400, detail=str(e)) from e
                 session.add(
                     IntegrationCredential(
-                        owner_id=payload.user_id,
+                        owner_id=user_id,
                         provider="github",
                         name="GitHub",
                         encrypted_secret=encrypted,
@@ -440,7 +492,7 @@ def create_connection(payload: CreateConnectionRequest):
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
             credential = IntegrationCredential(
-                owner_id=payload.user_id,
+                owner_id=user_id,
                 provider="linear",
                 name="Linear",
                 encrypted_secret=encrypted,
@@ -491,11 +543,11 @@ def create_connection(payload: CreateConnectionRequest):
 
 # --- Endpoint 5: CHAT THREADS & HISTORY ---
 @app.get("/chat/threads", response_model=List[ChatThreadDTO])
-def list_chat_threads(user_id: Optional[str] = Query(default=None)):
+def list_chat_threads(user_id: str = Depends(get_user_id)):
+    """List chat threads owned by the authenticated user."""
     with Session(engine) as session:
-        statement = select(ChatThread)
-        if user_id:
-            statement = statement.where(ChatThread.owner_id == user_id)
+        # Always scope to authenticated user
+        statement = select(ChatThread).where(ChatThread.owner_id == user_id)
         threads = session.exec(statement.order_by(ChatThread.updated_at.desc())).all()
         return [
             ChatThreadDTO(
@@ -508,11 +560,23 @@ def list_chat_threads(user_id: Optional[str] = Query(default=None)):
 
 
 @app.get("/chat/threads/{thread_id}/messages", response_model=List[ChatMessageDTO])
-def list_chat_messages(thread_id: str, limit: int = Query(default=100, ge=1, le=500)):
-    print(thread_id)
+def list_chat_messages(
+    thread_id: str,
+    limit: int = Query(default=100, ge=1, le=500),
+    user_id: str = Depends(get_user_id)
+):
+    """List messages from a thread owned by the authenticated user."""
     with Session(engine) as session:
-        thread = session.exec(select(ChatThread).where(ChatThread.external_thread_id == thread_id)).first()
+        thread = session.exec(
+            select(ChatThread)
+            .where(ChatThread.external_thread_id == thread_id)
+            .where(ChatThread.owner_id == user_id)
+        ).first()
         if not thread:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Thread not found or access denied"
+            )
             return []
 
         messages = session.exec(
@@ -536,10 +600,20 @@ def list_chat_messages(thread_id: str, limit: int = Query(default=100, ge=1, le=
 
 # --- Endpoint 6: REPORTS ---
 @app.get("/reports", response_model=List[ReportDTO])
-def list_reports(project_name: Optional[str] = Query(default=None), limit: int = Query(default=50, ge=1, le=200)):
+def list_reports(
+    project_name: Optional[str] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    user_id: str = Depends(get_user_id)
+):
+    """List analysis reports for repositories owned by the authenticated user."""
     with Session(engine) as session:
+        # Scope to user's repositories only
         report_rows = session.exec(
-            select(AnalysisReport).order_by(AnalysisReport.created_at.desc()).limit(limit)
+            select(AnalysisReport)
+            .join(Repository, AnalysisReport.repository_id == Repository.id)
+            .where(Repository.owner_id == user_id)
+            .order_by(AnalysisReport.created_at.desc())
+            .limit(limit)
         ).all()
 
         reports: List[ReportDTO] = []
