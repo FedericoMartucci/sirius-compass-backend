@@ -8,7 +8,7 @@ from fastapi import Request, status
 from fastapi.responses import StreamingResponse
 from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException, Depends, Query
-from fastapi.security import OAuth2PasswordBearer, HTTPBearer
+# from fastapi.security import OAuth2PasswordBearer, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
