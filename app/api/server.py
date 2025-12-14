@@ -428,13 +428,16 @@ def create_connection(
                 raise HTTPException(status_code=400, detail="repo_url is required for repository connections")
 
             repo_name = _parse_repo_name(payload.repo_url)
-            # Check if user already has this repo
+            
+            # Check if THIS user already has this repo
             repo = session.exec(
                 select(Repository)
-                .where(Repository.name == repo_name)
                 .where(Repository.owner_id == user_id)
+                .where(Repository.url == payload.repo_url)
             ).first()
+
             if not repo:
+                # Not found for this user, create new (even if URL exists for others)
                 repo = Repository(url=payload.repo_url, name=repo_name, owner_id=user_id)
                 session.add(repo)
                 session.commit()

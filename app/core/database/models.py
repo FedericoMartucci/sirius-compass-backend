@@ -1,13 +1,16 @@
 from typing import Any, Dict, List, Optional
 from datetime import datetime
-from sqlmodel import SQLModel, Field, Relationship
+from sqlmodel import SQLModel, Field, Relationship, UniqueConstraint
 from sqlalchemy import Column, Text, JSON
 
 class Repository(SQLModel, table=True):
-    __table_args__ = {"extend_existing": True}
+    __table_args__ = (
+        UniqueConstraint("owner_id", "url", name="unique_user_repo"),
+        {"extend_existing": True}
+    )
     
     id: Optional[int] = Field(default=None, primary_key=True)
-    url: str = Field(index=True, unique=True)
+    url: str = Field(index=True) # unique=False to allow multi-tenancy
     name: str
     owner_id: str = Field(index=True)  # Auth0 user ID for multi-tenancy
     last_analyzed: Optional[datetime] = None

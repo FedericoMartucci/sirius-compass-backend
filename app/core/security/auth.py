@@ -70,7 +70,7 @@ def verify_token(token: str) -> dict:
         jwks = get_jwks()
         rsa_key = {}
         for key in jwks.get("keys", []):
-            if key["kid"] == unverified_header["kid"]:
+            if key.get("kid") == unverified_header.get("kid"):
                 rsa_key = {
                     "kty": key["kty"],
                     "kid": key["kid"],
