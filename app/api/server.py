@@ -577,7 +577,6 @@ def list_chat_messages(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Thread not found or access denied"
             )
-            return []
 
         messages = session.exec(
             select(ChatMessage)
