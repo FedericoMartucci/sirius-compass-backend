@@ -600,6 +600,39 @@ def list_chat_messages(
         ]
 
 
+@app.delete("/chat/threads/{thread_id}")
+def delete_chat_thread(
+    thread_id: str,
+    user_id: str = Depends(get_user_id)
+):
+    """Delete a chat thread and all its messages."""
+    with Session(engine) as session:
+        thread = session.exec(
+            select(ChatThread)
+            .where(ChatThread.external_thread_id == thread_id)
+            .where(ChatThread.owner_id == user_id)
+        ).first()
+        
+        if not thread:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Thread not found or access denied"
+            )
+
+        # Delete messages first (manual cascade)
+        messages = session.exec(
+            select(ChatMessage).where(ChatMessage.chat_thread_id == thread.id)
+        ).all()
+        for m in messages:
+            session.delete(m)
+
+        # Delete thread
+        session.delete(thread)
+        session.commit()
+
+        return {"status": "success", "message": "Thread deleted"}
+
+
 # --- Endpoint 6: REPORTS ---
 @app.get("/reports", response_model=List[ReportDTO])
 def list_reports(
