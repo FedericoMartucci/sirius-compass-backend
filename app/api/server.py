@@ -1,24 +1,49 @@
 # app/api/server.py
 import asyncio
 import os
+from datetime import datetime, timezone
+from typing import List, Optional
 
 from fastapi import Request
 from fastapi.responses import StreamingResponse
 from urllib.parse import urlparse
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 # Import Schemas from your existing file
-from app.api.schemas import AnalyzeRequest, AnalyzeResponse, ChatRequest
+from app.api.schemas import (
+    AnalyzeRequest,
+    AnalyzeResponse,
+    ChatMessageDTO,
+    ChatRequest,
+    ChatThreadDTO,
+    ConnectionDTO,
+    CreateConnectionRequest,
+    CreateProjectRequest,
+    ProjectDTO,
+    ReportDTO,
+)
 
 from app.core.database.session import create_db_and_tables, engine
 from app.core.agents.analyst_graph import build_analyst_graph
 from app.core.agents.chat_graph import build_chat_graph
 from app.core.logger import get_logger
+from app.core.security.crypto import encrypt_secret
 from app.core.streaming import TokenStreamHandler, sse_data
+from app.core.database.models import (
+    AnalysisReport,
+    ChatMessage,
+    ChatThread,
+    IntegrationCredential,
+    Project,
+    ProjectIntegration,
+    ProjectRepository,
+    Repository,
+    Ticket,
+)
 from app.services.chat_storage import (
     append_message,
     coerce_content_to_text,
@@ -48,6 +73,32 @@ def _parse_repo_name(url_str: str) -> str:
         return f"{parts[-2]}/{parts[-1]}"
     except Exception:
         raise ValueError(f"Could not parse repository name from: {url_str}")
+
+
+def _format_relative_time(dt: Optional[datetime]) -> str:
+    if not dt:
+        return "Never"
+
+    now = datetime.now(timezone.utc)
+    dt_utc = dt
+    if dt_utc.tzinfo is None:
+        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+
+    delta = now - dt_utc
+    seconds = int(delta.total_seconds())
+    if seconds < 60:
+        return "Just now"
+
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} minutes ago"
+
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours} hours ago"
+
+    days = hours // 24
+    return f"{days} days ago"
 
 # --- Lifespan ---
 @asynccontextmanager
@@ -86,6 +137,7 @@ async def analyze_repo(request: AnalyzeRequest):
             "developer_name": request.developer_name,
             "lookback_days": request.lookback_days,
             "linear_team_key": request.linear_team_key,
+            "user_id": request.user_id,
             "activities": [],
             "analysis_logs": [],
             "final_report": None
@@ -202,3 +254,338 @@ async def chat_agent(payload: ChatRequest, http_request: Request):
     except Exception as e:
         logger.error(f"Chat Failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Endpoint 3: PROJECTS ---
+@app.get("/projects", response_model=List[ProjectDTO])
+def list_projects():
+    with Session(engine) as session:
+        projects = session.exec(select(Project).order_by(Project.updated_at.desc())).all()
+        return [ProjectDTO(id=str(p.id), name=p.name) for p in projects]
+
+
+@app.post("/projects", response_model=ProjectDTO)
+def create_project(payload: CreateProjectRequest):
+    name = payload.name.strip()
+    with Session(engine) as session:
+        existing = session.exec(select(Project).where(Project.name == name)).first()
+        if existing:
+            return ProjectDTO(id=str(existing.id), name=existing.name)
+
+        project = Project(name=name, created_at=datetime.utcnow(), updated_at=datetime.utcnow())
+        session.add(project)
+        session.commit()
+        session.refresh(project)
+        return ProjectDTO(id=str(project.id), name=project.name)
+
+
+# --- Endpoint 4: CONNECTIONS (Integrations) ---
+@app.get("/connections", response_model=List[ConnectionDTO])
+def list_connections(project_name: Optional[str] = Query(default=None)):
+    with Session(engine) as session:
+        projects: List[Project] = []
+        if project_name:
+            project = session.exec(select(Project).where(Project.name == project_name)).first()
+            if project:
+                projects = [project]
+        else:
+            projects = session.exec(select(Project)).all()
+
+        connections: List[ConnectionDTO] = []
+
+        # Repository connections
+        for project in projects:
+            links = session.exec(
+                select(ProjectRepository).where(ProjectRepository.project_id == project.id)
+            ).all()
+            for link in links:
+                repo = session.get(Repository, link.repository_id)
+                if not repo:
+                    continue
+
+                connections.append(
+                    ConnectionDTO(
+                        id=repo.id or 0,
+                        type="Repository",
+                        name=repo.name,
+                        project=project.name,
+                        status="active",
+                        lastSync=_format_relative_time(repo.last_synced_at),
+                    )
+                )
+
+        # Ticket board connections (Linear)
+        for project in projects:
+            integration = session.exec(
+                select(ProjectIntegration).where(
+                    ProjectIntegration.project_id == project.id,
+                    ProjectIntegration.provider == "linear",
+                )
+            ).first()
+
+            has_tickets = session.exec(
+                select(Ticket.id).where(
+                    Ticket.project_id == project.id,
+                    Ticket.source_platform == "linear",
+                )
+            ).first() is not None
+
+            if not integration and not has_tickets:
+                continue
+
+            team_key = (integration.settings.get("team_key") if integration else None) or "unknown"
+            last_ticket = session.exec(
+                select(Ticket)
+                .where(
+                    Ticket.project_id == project.id,
+                    Ticket.source_platform == "linear",
+                )
+                .order_by(Ticket.updated_at.desc())
+            ).first()
+
+            last_sync_dt = None
+            if last_ticket and last_ticket.updated_at:
+                last_sync_dt = last_ticket.updated_at
+            elif integration:
+                last_sync_dt = integration.updated_at
+
+            connections.append(
+                ConnectionDTO(
+                    id=(integration.id if integration and integration.id else 1_000_000 + (project.id or 0)),
+                    type="Board",
+                    name=f"Linear ({team_key})",
+                    project=project.name,
+                    status="active",
+                    lastSync=_format_relative_time(last_sync_dt),
+                )
+            )
+
+        return connections
+
+
+@app.post("/connections", response_model=ConnectionDTO)
+def create_connection(payload: CreateConnectionRequest):
+    connection_type = payload.type.strip().lower()
+    project_name = payload.project_name.strip()
+
+    with Session(engine) as session:
+        project = session.exec(select(Project).where(Project.name == project_name)).first()
+        if not project:
+            project = Project(name=project_name, created_at=datetime.utcnow(), updated_at=datetime.utcnow())
+            session.add(project)
+            session.commit()
+            session.refresh(project)
+
+        if connection_type in {"repository", "repo", "github"}:
+            if not payload.repo_url:
+                raise HTTPException(status_code=400, detail="repo_url is required for repository connections")
+
+            repo_name = _parse_repo_name(payload.repo_url)
+            repo = session.exec(select(Repository).where(Repository.name == repo_name)).first()
+            if not repo:
+                repo = Repository(url=payload.repo_url, name=repo_name)
+                session.add(repo)
+                session.commit()
+                session.refresh(repo)
+
+            link = session.exec(
+                select(ProjectRepository).where(
+                    ProjectRepository.project_id == project.id,
+                    ProjectRepository.repository_id == repo.id,
+                )
+            ).first()
+            if not link:
+                session.add(
+                    ProjectRepository(project_id=project.id, repository_id=repo.id, is_primary=True)
+                )
+
+            # Optional: store GitHub token for the user (used by /analyze if configured).
+            if payload.github_token and payload.user_id:
+                try:
+                    encrypted = encrypt_secret(payload.github_token)
+                except ValueError as e:
+                    raise HTTPException(status_code=400, detail=str(e)) from e
+                session.add(
+                    IntegrationCredential(
+                        owner_id=payload.user_id,
+                        provider="github",
+                        name="GitHub",
+                        encrypted_secret=encrypted,
+                        created_at=datetime.utcnow(),
+                        updated_at=datetime.utcnow(),
+                    )
+                )
+
+            project.updated_at = datetime.utcnow()
+            session.add(project)
+            session.commit()
+
+            return ConnectionDTO(
+                id=repo.id or 0,
+                type="Repository",
+                name=repo.name,
+                project=project.name,
+                status="active",
+                lastSync=_format_relative_time(repo.last_synced_at),
+            )
+
+        if connection_type in {"board", "linear"}:
+            if not payload.linear_api_key:
+                raise HTTPException(status_code=400, detail="linear_api_key is required for Linear connections")
+            if not payload.linear_team_key:
+                raise HTTPException(status_code=400, detail="linear_team_key is required for Linear connections")
+
+            try:
+                encrypted = encrypt_secret(payload.linear_api_key)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            credential = IntegrationCredential(
+                owner_id=payload.user_id,
+                provider="linear",
+                name="Linear",
+                encrypted_secret=encrypted,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            )
+            session.add(credential)
+            session.commit()
+            session.refresh(credential)
+
+            integration = session.exec(
+                select(ProjectIntegration).where(
+                    ProjectIntegration.project_id == project.id,
+                    ProjectIntegration.provider == "linear",
+                )
+            ).first()
+            if not integration:
+                integration = ProjectIntegration(
+                    project_id=project.id,
+                    provider="linear",
+                    credential_id=credential.id,
+                    settings={"team_key": payload.linear_team_key},
+                    created_at=datetime.utcnow(),
+                    updated_at=datetime.utcnow(),
+                )
+            else:
+                integration.credential_id = credential.id
+                integration.settings = {"team_key": payload.linear_team_key}
+                integration.updated_at = datetime.utcnow()
+
+            session.add(integration)
+            project.updated_at = datetime.utcnow()
+            session.add(project)
+            session.commit()
+            session.refresh(integration)
+
+            return ConnectionDTO(
+                id=integration.id or 0,
+                type="Board",
+                name=f"Linear ({payload.linear_team_key})",
+                project=project.name,
+                status="active",
+                lastSync=_format_relative_time(integration.updated_at),
+            )
+
+        raise HTTPException(status_code=400, detail=f"Unsupported connection type: {payload.type}")
+
+
+# --- Endpoint 5: CHAT THREADS & HISTORY ---
+@app.get("/chat/threads", response_model=List[ChatThreadDTO])
+def list_chat_threads(user_id: Optional[str] = Query(default=None)):
+    with Session(engine) as session:
+        statement = select(ChatThread)
+        if user_id:
+            statement = statement.where(ChatThread.owner_id == user_id)
+        threads = session.exec(statement.order_by(ChatThread.updated_at.desc())).all()
+        return [
+            ChatThreadDTO(
+                thread_id=t.external_thread_id,
+                title=t.title or "Conversation",
+                updated_at=t.updated_at,
+            )
+            for t in threads
+        ]
+
+
+@app.get("/chat/threads/{thread_id}/messages", response_model=List[ChatMessageDTO])
+def list_chat_messages(thread_id: str, limit: int = Query(default=100, ge=1, le=500)):
+    with Session(engine) as session:
+        thread = session.exec(select(ChatThread).where(ChatThread.external_thread_id == thread_id)).first()
+        if not thread:
+            raise HTTPException(status_code=404, detail="Thread not found")
+
+        messages = session.exec(
+            select(ChatMessage)
+            .where(ChatMessage.chat_thread_id == thread.id)
+            .order_by(ChatMessage.id.asc())
+            .limit(limit)
+        ).all()
+
+        return [
+            ChatMessageDTO(
+                id=m.id or 0,
+                role=m.role,
+                content=m.content,
+                created_at=m.created_at,
+                metadata=m.message_metadata or {},
+            )
+            for m in messages
+        ]
+
+
+# --- Endpoint 6: REPORTS ---
+@app.get("/reports", response_model=List[ReportDTO])
+def list_reports(project_name: Optional[str] = Query(default=None), limit: int = Query(default=50, ge=1, le=200)):
+    with Session(engine) as session:
+        report_rows = session.exec(
+            select(AnalysisReport).order_by(AnalysisReport.created_at.desc()).limit(limit)
+        ).all()
+
+        reports: List[ReportDTO] = []
+        for r in report_rows:
+            repo = session.get(Repository, r.repository_id)
+            repo_name = repo.name if repo else "unknown"
+
+            project_label = "unknown"
+            if project_name:
+                project_label = project_name
+            else:
+                link = session.exec(
+                    select(ProjectRepository).where(ProjectRepository.repository_id == r.repository_id)
+                ).first()
+                if link:
+                    project = session.get(Project, link.project_id)
+                    if project:
+                        project_label = project.name
+
+            if project_name and project_label != project_name:
+                continue
+
+            created = r.created_at
+            week = created.date().isoformat()
+
+            status = "watch"
+            if r.security_alerts:
+                status = "at-risk"
+            elif r.quality_score >= 7:
+                status = "healthy"
+            elif r.quality_score <= 3:
+                status = "at-risk"
+
+            summary = (r.feedback_summary or "").strip().replace("\n", " ")
+            if len(summary) > 120:
+                summary = summary[:120] + "..."
+
+            reports.append(
+                ReportDTO(
+                    id=r.id or 0,
+                    week=f"Week of {week}",
+                    project=project_label,
+                    repository=repo_name,
+                    status=status,
+                    summary=summary,
+                    created_at=created,
+                )
+            )
+
+        return reports

@@ -95,10 +95,11 @@ def append_message(
 
     thread = session.get(ChatThread, chat_thread_id)
     if thread:
+        if role == "user" and not thread.title and content:
+            thread.title = content.strip()[:80]
         thread.updated_at = datetime.utcnow()
         session.add(thread)
 
     session.commit()
     session.refresh(message)
     return message
-

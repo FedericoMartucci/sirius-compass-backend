@@ -26,8 +26,8 @@ class LinearAdapter:
     """
     BASE_URL = "https://api.linear.app/graphql"
 
-    def __init__(self):
-        self.api_key = os.getenv("LINEAR_API_KEY")
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key or os.getenv("LINEAR_API_KEY")
         if not self.api_key:
             logger.warning("⚠️ LINEAR_API_KEY not found. Velocity metrics will be skipped.")
             self._enabled = False

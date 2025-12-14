@@ -1,6 +1,6 @@
 import os
 import concurrent.futures
-from typing import List, Any
+from typing import Any, List, Optional
 from datetime import datetime, timedelta, timezone
 from github import Github, GithubException
 from app.core.models.domain import UnifiedActivity, ActivityType
@@ -14,8 +14,8 @@ class GitHubAdapter:
     Fetches ALL activity within the lookback window to populate the Data Lake (DB).
     """
 
-    def __init__(self):
-        token = os.getenv("GITHUB_TOKEN")
+    def __init__(self, token: Optional[str] = None):
+        token = token or os.getenv("GITHUB_TOKEN")
         if not token:
             logger.error("Missing GITHUB_TOKEN")
             raise ValueError("❌ Missing GITHUB_TOKEN in environment variables.")

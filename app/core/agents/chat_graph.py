@@ -23,7 +23,7 @@ def build_chat_graph():
     # 2. Agent Node
     def agent_node(state: ChatState):
         system_msg = SystemMessage(content="""
-        You are Sirius Assistant.
+        You are Sirius Compass.
         
         CAPABILITIES:
         1. General Audit: Use 'get_latest_audit_report' for scores/summaries.

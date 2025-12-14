@@ -12,6 +12,7 @@ class GraphState(TypedDict):
     developer_name: str
     lookback_days: int
     linear_team_key: Optional[str]
+    user_id: Optional[str]
     
     # 'operator.add' allows parallel nodes to append to this list instead of overwriting
     activities: Annotated[List[UnifiedActivity], operator.add]

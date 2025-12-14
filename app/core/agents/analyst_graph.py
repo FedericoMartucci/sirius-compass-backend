@@ -7,17 +7,20 @@ from app.core.agents.nodes import analyze_activities_node, generate_report_node
 from app.adapters.github.adapter import GitHubAdapter
 from app.adapters.linear.adapter import LinearAdapter
 from app.core.models.domain import UnifiedActivity, ActivityType
-from app.core.database.session import get_session
+from app.core.database.session import engine, get_session
 from app.core.database.models import (
     Activity,
     AnalysisReport,
+    IntegrationCredential,
     Project,
+    ProjectIntegration,
     ProjectRepository,
     Repository,
     Ticket,
     TicketEvent,
 )
-from sqlmodel import select
+from app.core.security.crypto import decrypt_secret
+from sqlmodel import Session, select
 from app.core.logger import get_logger
 
 logger = get_logger(__name__)
@@ -28,14 +31,54 @@ async def ingest_data_node(state: GraphState):
     Fetches data from GitHub and Linear simultaneously using asyncio.
     """
     repo_name = state["repo_name"]
+    project_name = state.get("project_name") or repo_name
     # Use lookback_days from state (default 90).
     days = state.get("lookback_days", 90)
     linear_team_key = state.get("linear_team_key")
+    user_id = state.get("user_id")
     
     logger.info(f"🚀 Starting Parallel Ingestion for: {repo_name} (Lookback: {days} days)")
 
-    gh_adapter = GitHubAdapter()
-    lin_adapter = LinearAdapter()
+    github_token = None
+    linear_api_key = None
+    if user_id:
+        try:
+            with Session(engine) as session:
+                github_cred = session.exec(
+                    select(IntegrationCredential)
+                    .where(
+                        IntegrationCredential.owner_id == user_id,
+                        IntegrationCredential.provider == "github",
+                    )
+                    .order_by(IntegrationCredential.updated_at.desc())
+                ).first()
+                if github_cred:
+                    github_token = decrypt_secret(github_cred.encrypted_secret)
+
+                project_db = session.exec(select(Project).where(Project.name == project_name)).first()
+                if project_db:
+                    linear_integration = session.exec(
+                        select(ProjectIntegration)
+                        .where(
+                            ProjectIntegration.project_id == project_db.id,
+                            ProjectIntegration.provider == "linear",
+                        )
+                        .order_by(ProjectIntegration.updated_at.desc())
+                    ).first()
+
+                    if linear_integration:
+                        if not linear_team_key:
+                            linear_team_key = linear_integration.settings.get("team_key")
+
+                        if linear_integration.credential_id:
+                            linear_cred = session.get(IntegrationCredential, linear_integration.credential_id)
+                            if linear_cred:
+                                linear_api_key = decrypt_secret(linear_cred.encrypted_secret)
+        except Exception as e:
+            logger.warning(f"Failed to load integration credentials from DB: {e}")
+
+    gh_adapter = GitHubAdapter(token=github_token)
+    lin_adapter = LinearAdapter(api_key=linear_api_key)
 
     # Create async tasks (wrap synchronous calls in threads)
     task_gh = asyncio.to_thread(gh_adapter.fetch_recent_activity, repo_name, days)
