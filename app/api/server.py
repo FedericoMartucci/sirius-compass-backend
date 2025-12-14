@@ -33,7 +33,7 @@ from app.core.agents.analyst_graph import build_analyst_graph
 from app.core.agents.chat_graph import build_chat_graph
 from app.core.logger import get_logger
 from app.core.security.crypto import encrypt_secret
-from app.core.security.auth import get_current_user, get_user_id
+from app.core.security.auth import get_user_id
 from app.core.streaming import TokenStreamHandler, sse_data
 from app.core.database.models import (
     AnalysisReport,
