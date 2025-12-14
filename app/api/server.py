@@ -4,7 +4,7 @@ import os
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from fastapi import Request
+from fastapi import Request, status
 from fastapi.responses import StreamingResponse
 from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException, Depends, Query
