@@ -84,6 +84,10 @@ class SyncService:
         now = datetime.now(timezone.utc)
         
         if repo.last_synced_at:
+            # Ensure timezone awareness (SQLite stores naive)
+            if repo.last_synced_at.tzinfo is None:
+                repo.last_synced_at = repo.last_synced_at.replace(tzinfo=timezone.utc)
+
             # Incremental Update: Fetch only what's new since last sync
             # Add a small buffer (e.g., 1 min) to avoid missing overlapping commits
             since_date = repo.last_synced_at

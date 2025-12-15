@@ -88,6 +88,37 @@ def get_developer_activity(repo_name: str, developer_name: str, limit: int = 7):
             output += f"- {act.timestamp.date()}: {_format_commit_title(act.title)} (sha: {sha_short})\n"
             
         return output
+            
+
+@tool
+def get_repository_activity(repo_name: str, limit: int = 10):
+    """
+    Fetches the global recent activity (commits) for a repository, regardless of the author.
+    Use this when the user asks "What is the latest commit in the repo?" or "Show me recent activity" without specifying a person.
+    """
+    with Session(engine) as session:
+        repo = session.exec(select(Repository).where(Repository.name.contains(repo_name))).first()
+        if not repo: return "Repository not found."
+        
+        statement = (
+            select(Activity)
+            .where(Activity.repository_id == repo.id)
+            .where(Activity.type == "COMMIT")
+            .order_by(Activity.timestamp.desc())
+            .limit(limit)
+        )
+        activities = session.exec(statement).all()
+        
+        commits = [a for a in activities if not _is_merge_commit(a.title or "")]
+        if not commits:
+            return f"No commits found in '{repo_name}'."
+            
+        output = f"Last {len(commits)} commits in {repo.name} (all authors):\n"
+        for act in commits:
+            sha_short = (act.source_id or "")[:7]
+            output += f"- {act.timestamp.date()} | {act.author}: {_format_commit_title(act.title)} (sha: {sha_short})\n"
+            
+        return output
 
 
 @tool
