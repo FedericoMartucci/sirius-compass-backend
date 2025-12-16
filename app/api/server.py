@@ -425,7 +425,12 @@ def list_connections(
                 if not repo:
                     continue
 
-                status, error = get_status_from_run(latest_repo_run.get(repo.id or 0))
+                run = latest_repo_run.get(repo.id or 0)
+                status, error = get_status_from_run(run)
+                
+                # Use run timestamp if available (user preference), else fallback to repo field
+                last_sync_time = run.created_at if run else repo.last_synced_at
+
                 connections.append(
                     ConnectionDTO(
                         id=repo.id or 0,
@@ -433,7 +438,7 @@ def list_connections(
                         name=repo.name,
                         project=project.name,
                         status=status,
-                        lastSync=_format_relative_time(repo.last_synced_at),
+                        lastSync=_format_relative_time(last_sync_time),
                         last_error=error,
                     )
                 )
@@ -472,10 +477,13 @@ def list_connections(
                 last_sync_dt = last_ticket.updated_at
             elif integration:
                 last_sync_dt = integration.updated_at
+            
+            run = latest_project_run.get(project.id or 0)
+            status, error = get_status_from_run(run)
 
-            status, error = get_status_from_run(
-                latest_project_run.get(project.id or 0)
-            )
+            # Use run timestamp if available (user preference)
+            if run:
+                last_sync_dt = run.created_at
 
             connections.append(
                 ConnectionDTO(

@@ -84,7 +84,7 @@ class LinearAdapter:
             filter_lines.append("team: { key: { eq: $teamKey } }")
 
         if updated_since:
-            variable_defs.append("$updatedSince: DateTime!")
+            variable_defs.append("$updatedSince: DateTimeOrDuration!")
             variables["updatedSince"] = updated_since.isoformat()
             filter_lines.append("updatedAt: { gte: $updatedSince }")
 
