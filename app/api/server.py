@@ -7,7 +7,7 @@ from typing import List, Optional
 from fastapi import Request, status
 from fastapi.responses import StreamingResponse
 from urllib.parse import urlparse
-from fastapi import FastAPI, HTTPException, Depends, Query
+from fastapi import FastAPI, HTTPException, Depends, Query, Body
 # from fastapi.security import OAuth2PasswordBearer, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
@@ -772,6 +772,51 @@ def list_chat_threads(user_id: str = Depends(get_user_id)):
             )
             for t in threads
         ]
+
+
+@app.patch("/chat/threads/{thread_id}", response_model=ChatThreadDTO)
+def update_chat_thread(
+    thread_id: str,
+    payload: dict = Body(...),
+    user_id: str = Depends(get_user_id),
+):
+    """Update a chat thread's title (owned by the authenticated user)."""
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+
+    title = payload.get("title")
+    if title is None:
+        raise HTTPException(status_code=400, detail="title is required")
+    if not isinstance(title, str):
+        raise HTTPException(status_code=400, detail="title must be a string")
+
+    title = title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title must be non-empty")
+    if len(title) > 255:
+        raise HTTPException(status_code=400, detail="title must be <= 255 characters")
+
+    with Session(engine) as session:
+        thread = session.exec(
+            select(ChatThread)
+            .where(ChatThread.external_thread_id == thread_id)
+            .where(ChatThread.owner_id == user_id)
+        ).first()
+        if not thread:
+            raise HTTPException(status_code=404, detail="Thread not found")
+
+        thread.title = title
+        thread.updated_at = datetime.utcnow()
+        session.add(thread)
+        session.commit()
+        session.refresh(thread)
+
+        return ChatThreadDTO(
+            thread_id=thread.external_thread_id,
+            title=thread.title or "Conversation",
+            updated_at=thread.updated_at,
+        )
 
 
 @app.get("/chat/threads/{thread_id}/messages", response_model=List[ChatMessageDTO])
