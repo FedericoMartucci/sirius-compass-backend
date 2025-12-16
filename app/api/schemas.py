@@ -1,5 +1,5 @@
 from datetime import datetime
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, AliasChoices, ConfigDict
 from typing import Any, Dict, List, Optional
 
 class AnalyzeRequest(BaseModel):
@@ -32,6 +32,25 @@ class ProjectDTO(BaseModel):
 
 class CreateProjectRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
+
+
+class GuestDTO(BaseModel):
+    id: int
+    email: str
+
+
+class ProjectGuestDTO(BaseModel):
+    project_id: int
+    guest: GuestDTO
+    role: str
+    created_at: datetime
+
+
+class InviteGuestRequest(BaseModel):
+    project_id: Optional[int] = None
+    project_name: Optional[str] = None
+    email: str = Field(..., min_length=3, max_length=320)
+    role: str = Field(default="viewer", min_length=3, max_length=50)
 
 
 class ConnectionDTO(BaseModel):
@@ -104,3 +123,28 @@ class SyncRunDTO(BaseModel):
     progress_total: Optional[int] = None
     message: Optional[str] = None
     details: Dict[str, Any] = Field(default_factory=dict)
+
+
+class UserSettingsDTO(BaseModel):
+    """User-scoped UI settings."""
+
+    default_project_id: Optional[str] = None
+    default_time_range: str = "30d"
+
+
+class SaveUserSettingsPayload(BaseModel):
+    """Payload for PUT /user-settings.
+
+    Accepts both snake_case and camelCase inputs.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    default_project_id: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("default_project_id", "defaultProjectId"),
+    )
+    default_time_range: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("default_time_range", "defaultTimeRange"),
+    )

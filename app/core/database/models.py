@@ -120,6 +120,61 @@ class ProjectRepository(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
 
 
+class Guest(SQLModel, table=True):
+    """A guest user invited to access one or more projects.
+
+    Guests are primarily identified by email (invite flow). If/when the invited person
+    authenticates, we can also link their Auth0 subject to `external_user_id`.
+    """
+
+    __table_args__ = (
+        UniqueConstraint("email", name="unique_guest_email"),
+        {"extend_existing": True},
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    email: str = Field(index=True)
+
+    external_user_id: Optional[str] = Field(default=None, index=True)
+    invited_by_owner_id: Optional[str] = Field(default=None, index=True)
+
+    created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+    accepted_at: Optional[datetime] = Field(default=None, index=True)
+
+
+class ProjectGuest(SQLModel, table=True):
+    """Many-to-many relationship between Project and Guest."""
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "guest_id", name="unique_project_guest"),
+        {"extend_existing": True},
+    )
+
+    project_id: int = Field(foreign_key="project.id", primary_key=True)
+    guest_id: int = Field(foreign_key="guest.id", primary_key=True)
+    role: str = Field(default="viewer", index=True)
+    created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+
+
+class UserSettings(SQLModel, table=True):
+    """Per-user settings keyed by Auth0 `sub` (multi-tenancy)."""
+
+    __table_args__ = (
+        UniqueConstraint("user_id", name="unique_user_settings_user_id"),
+        {"extend_existing": True},
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: str = Field(index=True)
+
+    # Stored as FK to internal Project.id; returned to clients as string.
+    default_project_id: Optional[int] = Field(default=None, foreign_key="project.id", index=True)
+    default_time_range: str = Field(default="30d", index=True)
+
+    created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+    updated_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+
+
 class Ticket(SQLModel, table=True):
     """
     Canonical ticket entity (Linear/Trello/etc.).
