@@ -229,3 +229,38 @@ class ProjectIntegration(SQLModel, table=True):
 
     created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
     updated_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+
+
+class SyncJob(SQLModel, table=True):
+    """Background sync job persisted for polling from the frontend."""
+
+    __table_args__ = {"extend_existing": True}
+
+    id: str = Field(primary_key=True, index=True)  # e.g. syncjob_<uuid>
+    owner_id: str = Field(index=True)
+
+    connection_type: str = Field(index=True)  # "repository" | "board"
+    connection_id: int = Field(index=True)
+
+    state: str = Field(default="queued", index=True)  # queued|running|waiting_rate_limit|completed|failed
+    progress: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    snapshots: List[Dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+
+    next_run_at: Optional[datetime] = Field(default=None, index=True)
+    error: Optional[str] = Field(default=None, sa_column=Column(Text))
+
+    created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+    updated_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+
+
+class LinearRateLimitBucket(SQLModel, table=True):
+    """DB-backed token bucket for Linear API rate limits per credential.
+
+    Capacity: 5 tokens per 300 seconds.
+    """
+
+    __table_args__ = {"extend_existing": True}
+
+    credential_id: int = Field(foreign_key="integrationcredential.id", primary_key=True)
+    window_started_at: Optional[datetime] = Field(default=None, index=True)
+    tokens_used: int = Field(default=0)

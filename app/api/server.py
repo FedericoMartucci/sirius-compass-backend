@@ -1,7 +1,7 @@
 # app/api/server.py
 import asyncio
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 
 from fastapi import Request, status
@@ -52,6 +52,8 @@ from app.services.chat_storage import (
     get_or_create_thread,
     load_thread_messages,
 )
+
+from app.services.sync_jobs import create_job, get_job, maybe_resume_job, schedule_job
 
 load_dotenv()
 logger = get_logger(__name__)
@@ -663,3 +665,162 @@ def list_reports(
             )
 
         return reports
+
+
+@app.delete("/reports/{report_id}")
+def delete_report(report_id: int):
+    with Session(engine) as session:
+        report = session.get(AnalysisReport, report_id)
+        if not report:
+            raise HTTPException(status_code=404, detail="Report not found")
+        session.delete(report)
+        session.commit()
+        return {"status": "success", "message": "Report deleted"}
+
+
+@app.delete("/connections/{connection_id}")
+def delete_connection(connection_id: int, type: str = Query(..., description="Type of connection: 'Repository' or 'Board'")):
+    with Session(engine) as session:
+        if type.lower() == "repository":
+            # Find any project links to this repo and remove them
+            links = session.exec(select(ProjectRepository).where(ProjectRepository.repository_id == connection_id)).all()
+            if not links:
+                raise HTTPException(status_code=404, detail="Connection not found")
+            for link in links:
+                session.delete(link)
+            session.commit()
+            return {"status": "success", "message": "Repository connection removed"}
+            
+        elif type.lower() == "board":
+            # Handle synthetic IDs or missing integration records
+            project_id = None
+            integration = session.get(ProjectIntegration, connection_id)
+            
+            if integration:
+                project_id = integration.project_id
+                session.delete(integration)
+            elif connection_id >= 1000000:
+                # Fallback for synthetic IDs generated in list_connections
+                project_id = connection_id - 1000000
+                # Try to find integration by project_id just in case
+                integration = session.exec(select(ProjectIntegration).where(
+                    ProjectIntegration.project_id == project_id,
+                    ProjectIntegration.provider == "linear"
+                )).first()
+                if integration:
+                    session.delete(integration)
+            
+            if not project_id:
+                 raise HTTPException(status_code=404, detail="Connection not found")
+
+            # Also delete tickets to ensure it disappears from the list (which shows ghost connections if tickets exist)
+            tickets = session.exec(select(Ticket).where(
+                Ticket.project_id == project_id,
+                Ticket.source_platform == "linear"
+            )).all()
+            
+            for t in tickets:
+                session.delete(t)
+
+            session.commit()
+            return {"status": "success", "message": "Board connection removed"}
+            
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown connection type: {type}")
+
+
+@app.post("/connections/{connection_id}/sync", status_code=status.HTTP_202_ACCEPTED)
+def trigger_connection_sync(
+    connection_id: int,
+    type: str = Query(..., description="Repository|Board"),
+    user_id: str = Depends(get_user_id),
+):
+    """Dispara un sync y devuelve un ticket inmediatamente."""
+    connection_type = (type or "").strip().lower()
+    if connection_type not in {"repository", "board"}:
+        raise HTTPException(status_code=400, detail="type must be Repository or Board")
+
+    with Session(engine) as session:
+        if connection_type == "repository":
+            repo = session.exec(
+                select(Repository)
+                .where(Repository.id == connection_id)
+                .where(Repository.owner_id == user_id)
+            ).first()
+            if not repo:
+                raise HTTPException(status_code=404, detail="Repository not found or access denied")
+
+        if connection_type == "board":
+            project_id = None
+            integration = session.get(ProjectIntegration, connection_id)
+
+            if integration and integration.provider != "linear":
+                integration = None
+
+            if integration:
+                project_id = integration.project_id
+            elif connection_id >= 1_000_000:
+                project_id = connection_id - 1_000_000
+                integration = session.exec(
+                    select(ProjectIntegration).where(
+                        ProjectIntegration.project_id == project_id,
+                        ProjectIntegration.provider == "linear",
+                    )
+                ).first()
+
+            if not project_id:
+                raise HTTPException(status_code=404, detail="Board connection not found")
+
+            has_access = session.exec(
+                select(ProjectRepository.project_id)
+                .join(Repository, ProjectRepository.repository_id == Repository.id)
+                .where(ProjectRepository.project_id == project_id)
+                .where(Repository.owner_id == user_id)
+                .limit(1)
+            ).first() is not None
+            if not has_access:
+                raise HTTPException(status_code=404, detail="Project not found or access denied")
+
+            if not integration or not integration.credential_id:
+                raise HTTPException(status_code=400, detail="Linear integration not configured for this project")
+
+    job = create_job(owner_id=user_id, connection_type=connection_type, connection_id=connection_id)
+    schedule_job(job.id)
+    return {"ticket": job.id, "status": "queued"}
+
+
+@app.get("/connections/sync/{ticket}")
+def get_connection_sync_status(
+    ticket: str,
+    user_id: str = Depends(get_user_id),
+):
+    """Consulta el estado del job para polling desde el frontend."""
+    maybe_resume_job(ticket, owner_id=user_id)
+
+    job = get_job(ticket, owner_id=user_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Sync job not found or access denied")
+
+    now = datetime.now(timezone.utc)
+    next_poll_at = None
+
+    if job.state == "waiting_rate_limit":
+        next_poll_at = job.next_run_at
+    elif job.state in {"queued", "running"}:
+        next_poll_at = now + timedelta(seconds=2)
+
+    def _iso(dt: Optional[datetime]) -> Optional[str]:
+        if not dt:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
+
+    return {
+        "ticket": job.id,
+        "state": job.state,
+        "progress": job.progress or {},
+        "nextPollAt": _iso(next_poll_at),
+        "error": job.error,
+        "snapshots": job.snapshots or [],
+    }
