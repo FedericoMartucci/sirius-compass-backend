@@ -26,6 +26,8 @@ from app.api.schemas import (
     CreateProjectRequest,
     ProjectDTO,
     ReportDTO,
+    SyncRequest,
+    SyncRunDTO,
 )
 
 from app.core.database.session import create_db_and_tables, engine
@@ -39,12 +41,15 @@ from app.core.database.models import (
     AnalysisReport,
     ChatMessage,
     ChatThread,
+    DataCoverage,
     IntegrationCredential,
     Project,
     ProjectIntegration,
     ProjectRepository,
     Repository,
+    SyncRun,
     Ticket,
+    TicketEvent,
 )
 from app.services.chat_storage import (
     append_message,
@@ -52,6 +57,7 @@ from app.services.chat_storage import (
     get_or_create_thread,
     load_thread_messages,
 )
+from app.services.sync_queue import enqueue_sync_run
 
 load_dotenv()
 logger = get_logger(__name__)
@@ -133,6 +139,27 @@ async def analyze_repo(
         repo_name = _parse_repo_name(request.repo_url)
         project_name = request.project_name or repo_name
         
+        # Prevent heavy analysis while a sync is running for the same repo.
+        with Session(engine) as session:
+            repo_row = session.exec(
+                select(Repository)
+                .where(Repository.owner_id == user_id)
+                .where(Repository.name == repo_name)
+            ).first()
+            if repo_row:
+                active = session.exec(
+                    select(SyncRun)
+                    .where(SyncRun.owner_id == user_id)
+                    .where(SyncRun.repository_id == repo_row.id)
+                    .where(SyncRun.status.in_(["queued", "running"]))
+                    .order_by(SyncRun.created_at.desc())
+                ).first()
+                if active:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"Sync in progress (run_id={active.id}). Please wait until it finishes before running analysis.",
+                    )
+
         # 2. Build Graph
         workflow = build_analyst_graph()
         
@@ -185,11 +212,17 @@ async def chat_agent(
         project_name = payload.project_name or payload.repo_name
         with Session(engine) as session:
             # Always use authenticated user_id for thread ownership
-            thread = get_or_create_thread(
-                session,
-                external_thread_id=payload.thread_id,
-                owner_id=user_id,
-            )
+            try:
+                thread = get_or_create_thread(
+                    session,
+                    external_thread_id=payload.thread_id,
+                    owner_id=user_id,
+                )
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=str(e),
+                ) from e
             thread_db_id = thread.id
             history = load_thread_messages(session, thread_db_id, limit=50)
             append_message(
@@ -214,7 +247,15 @@ async def chat_agent(
                 handler = TokenStreamHandler()
                 task = asyncio.create_task(
                     workflow.ainvoke(
-                        {"messages": messages},
+                        {
+                            "messages": messages,
+                            "meta": {
+                                "user_id": user_id,
+                                "thread_id": payload.thread_id,
+                                "project_name": project_name,
+                                "repo_name": payload.repo_name,
+                            },
+                        },
                         config={"callbacks": [handler]},
                     )
                 )
@@ -249,7 +290,17 @@ async def chat_agent(
 
             return StreamingResponse(event_generator(), media_type="text/event-stream")
 
-        result = await workflow.ainvoke({"messages": messages})
+        result = await workflow.ainvoke(
+            {
+                "messages": messages,
+                "meta": {
+                    "user_id": user_id,
+                    "thread_id": payload.thread_id,
+                    "project_name": project_name,
+                    "repo_name": payload.repo_name,
+                },
+            }
+        )
         last_message = result["messages"][-1]
         assistant_text = coerce_content_to_text(last_message.content)
 
@@ -318,6 +369,35 @@ def list_connections(
 ):
     """List connections scoped to authenticated user's projects."""
     with Session(engine) as session:
+        active_runs = session.exec(
+            select(SyncRun)
+            .where(SyncRun.owner_id == user_id)
+            .where(SyncRun.status.in_(["queued", "running"]))
+            .order_by(SyncRun.created_at.desc())
+        ).all()
+        active_repo_run: dict[int, SyncRun] = {}
+        active_project_run: dict[int, SyncRun] = {}
+        for r in active_runs:
+            if r.repository_id and r.repository_id not in active_repo_run:
+                active_repo_run[r.repository_id] = r
+            if r.project_id and r.project_id not in active_project_run and r.provider in {"linear", "all"}:
+                active_project_run[r.project_id] = r
+
+        failed_runs = session.exec(
+            select(SyncRun)
+            .where(SyncRun.owner_id == user_id)
+            .where(SyncRun.status == "failed")
+            .order_by(SyncRun.created_at.desc())
+            .limit(200)
+        ).all()
+        failed_repo_run: dict[int, SyncRun] = {}
+        failed_project_run: dict[int, SyncRun] = {}
+        for r in failed_runs:
+            if r.repository_id and r.repository_id not in failed_repo_run:
+                failed_repo_run[r.repository_id] = r
+            if r.project_id and r.project_id not in failed_project_run and r.provider in {"linear", "all"}:
+                failed_project_run[r.project_id] = r
+
         projects: List[Project] = []
         # Only fetch projects that have repositories owned by this user
         base_query = (
@@ -352,7 +432,11 @@ def list_connections(
                         type="Repository",
                         name=repo.name,
                         project=project.name,
-                        status="active",
+                        status=(
+                            "syncing"
+                            if (repo.id or 0) in active_repo_run
+                            else ("error" if (repo.id or 0) in failed_repo_run else "active")
+                        ),
                         lastSync=_format_relative_time(repo.last_synced_at),
                     )
                 )
@@ -398,7 +482,11 @@ def list_connections(
                     type="Board",
                     name=f"Linear ({team_key})",
                     project=project.name,
-                    status="active",
+                    status=(
+                        "syncing"
+                        if (project.id or 0) in active_project_run
+                        else ("error" if (project.id or 0) in failed_project_run else "active")
+                    ),
                     lastSync=_format_relative_time(last_sync_dt),
                 )
             )
@@ -544,6 +632,124 @@ def create_connection(
         raise HTTPException(status_code=400, detail=f"Unsupported connection type: {payload.type}")
 
 
+# --- Endpoint 4.5: SYNC (Background Ingestion) ---
+@app.post("/sync", response_model=SyncRunDTO)
+async def start_sync(
+    payload: SyncRequest,
+    user_id: str = Depends(get_user_id),
+):
+    """
+    Starts a background sync run to ingest data from external providers into the DB.
+
+    This endpoint is intentionally separate from `/analyze`:
+    - `/sync` = ingest + persist (fast, no LLM)
+    - `/analyze` = ingest + LLM + report (slow, expensive)
+    """
+
+    providers = [p.strip().lower() for p in (payload.providers or []) if p and p.strip()]
+    allowed = {"github", "linear"}
+    if not providers:
+        providers = ["github", "linear"]
+    if any(p not in allowed for p in providers):
+        raise HTTPException(status_code=400, detail=f"Unsupported providers: {providers}")
+
+    project_name = payload.project_name.strip()
+
+    repo_name = None
+    if payload.repo_name:
+        try:
+            repo_name = _parse_repo_name(payload.repo_name)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+    if "github" in providers and not repo_name:
+        raise HTTPException(
+            status_code=400,
+            detail="repo_name is required for GitHub sync (expected 'owner/repo' or a GitHub URL).",
+        )
+
+    run = enqueue_sync_run(
+        owner_id=user_id,
+        project_name=project_name,
+        repo_name=repo_name,
+        providers=providers,
+        full_history=payload.full_history,
+        max_commits=payload.max_commits,
+        max_prs=payload.max_prs,
+        max_tickets=payload.max_tickets,
+    )
+
+    return SyncRunDTO(
+        id=run.id or 0,
+        status=run.status,
+        provider=run.provider,
+        created_at=run.created_at,
+        started_at=run.started_at,
+        finished_at=run.finished_at,
+        progress_current=run.progress_current,
+        progress_total=run.progress_total,
+        message=run.message,
+        details=run.details or {},
+    )
+
+
+@app.get("/sync/runs", response_model=List[SyncRunDTO])
+def list_sync_runs(
+    limit: int = Query(default=50, ge=1, le=200),
+    user_id: str = Depends(get_user_id),
+):
+    with Session(engine) as session:
+        runs = session.exec(
+            select(SyncRun)
+            .where(SyncRun.owner_id == user_id)
+            .order_by(SyncRun.created_at.desc())
+            .limit(limit)
+        ).all()
+        return [
+            SyncRunDTO(
+                id=r.id or 0,
+                status=r.status,
+                provider=r.provider,
+                created_at=r.created_at,
+                started_at=r.started_at,
+                finished_at=r.finished_at,
+                progress_current=r.progress_current,
+                progress_total=r.progress_total,
+                message=r.message,
+                details=r.details or {},
+            )
+            for r in runs
+        ]
+
+
+@app.get("/sync/runs/{run_id}", response_model=SyncRunDTO)
+def get_sync_run(
+    run_id: int,
+    user_id: str = Depends(get_user_id),
+):
+    with Session(engine) as session:
+        run = session.exec(
+            select(SyncRun)
+            .where(SyncRun.id == run_id)
+            .where(SyncRun.owner_id == user_id)
+        ).first()
+        if not run:
+            raise HTTPException(status_code=404, detail="Sync run not found")
+
+        return SyncRunDTO(
+            id=run.id or 0,
+            status=run.status,
+            provider=run.provider,
+            created_at=run.created_at,
+            started_at=run.started_at,
+            finished_at=run.finished_at,
+            progress_current=run.progress_current,
+            progress_total=run.progress_total,
+            message=run.message,
+            details=run.details or {},
+        )
+
+
 # --- Endpoint 5: CHAT THREADS & HISTORY ---
 @app.get("/chat/threads", response_model=List[ChatThreadDTO])
 def list_chat_threads(user_id: str = Depends(get_user_id)):
@@ -576,10 +782,8 @@ def list_chat_messages(
             .where(ChatThread.owner_id == user_id)
         ).first()
         if not thread:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Thread not found or access denied"
-            )
+            # Idempotent behavior: a new local thread may not exist in DB yet.
+            return []
 
         messages = session.exec(
             select(ChatMessage)
@@ -614,10 +818,8 @@ def delete_chat_thread(
         ).first()
         
         if not thread:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Thread not found or access denied"
-            )
+            # Idempotent delete.
+            return {"status": "success", "message": "Thread deleted"}
 
         # Delete messages first (manual cascade)
         messages = session.exec(
@@ -705,9 +907,17 @@ def list_reports(
 
 
 @app.delete("/reports/{report_id}")
-def delete_report(report_id: int):
+def delete_report(
+    report_id: int,
+    user_id: str = Depends(get_user_id),
+):
     with Session(engine) as session:
-        report = session.get(AnalysisReport, report_id)
+        report = session.exec(
+            select(AnalysisReport)
+            .join(Repository, AnalysisReport.repository_id == Repository.id)
+            .where(AnalysisReport.id == report_id)
+            .where(Repository.owner_id == user_id)
+        ).first()
         if not report:
             raise HTTPException(status_code=404, detail="Report not found")
         session.delete(report)
@@ -716,13 +926,25 @@ def delete_report(report_id: int):
 
 
 @app.delete("/connections/{connection_id}")
-def delete_connection(connection_id: int, type: str = Query(..., description="Type of connection: 'Repository' or 'Board'")):
+def delete_connection(
+    connection_id: int,
+    type: str = Query(..., description="Type of connection: 'Repository' or 'Board'"),
+    user_id: str = Depends(get_user_id),
+):
     with Session(engine) as session:
         if type.lower() == "repository":
+            repo = session.exec(
+                select(Repository)
+                .where(Repository.id == connection_id)
+                .where(Repository.owner_id == user_id)
+            ).first()
+            if not repo:
+                raise HTTPException(status_code=404, detail="Connection not found")
+
             # Find any project links to this repo and remove them
             links = session.exec(select(ProjectRepository).where(ProjectRepository.repository_id == connection_id)).all()
             if not links:
-                raise HTTPException(status_code=404, detail="Connection not found")
+                return {"status": "success", "message": "Repository connection removed"}
             for link in links:
                 session.delete(link)
             session.commit()
@@ -734,6 +956,13 @@ def delete_connection(connection_id: int, type: str = Query(..., description="Ty
             integration = session.get(ProjectIntegration, connection_id)
             
             if integration:
+                credential_owner_id = None
+                if integration.credential_id:
+                    credential = session.get(IntegrationCredential, integration.credential_id)
+                    if credential:
+                        credential_owner_id = credential.owner_id
+                if credential_owner_id and credential_owner_id != user_id:
+                    raise HTTPException(status_code=404, detail="Connection not found")
                 project_id = integration.project_id
                 session.delete(integration)
             elif connection_id >= 1000000:
@@ -745,6 +974,13 @@ def delete_connection(connection_id: int, type: str = Query(..., description="Ty
                     ProjectIntegration.provider == "linear"
                 )).first()
                 if integration:
+                    credential_owner_id = None
+                    if integration.credential_id:
+                        credential = session.get(IntegrationCredential, integration.credential_id)
+                        if credential:
+                            credential_owner_id = credential.owner_id
+                    if credential_owner_id and credential_owner_id != user_id:
+                        raise HTTPException(status_code=404, detail="Connection not found")
                     session.delete(integration)
             
             if not project_id:
@@ -755,9 +991,17 @@ def delete_connection(connection_id: int, type: str = Query(..., description="Ty
                 Ticket.project_id == project_id,
                 Ticket.source_platform == "linear"
             )).all()
+            ticket_ids = [t.id for t in tickets if t.id is not None]
             
             for t in tickets:
                 session.delete(t)
+
+            if ticket_ids:
+                events = session.exec(
+                    select(TicketEvent).where(TicketEvent.ticket_id.in_(ticket_ids))
+                ).all()
+                for e in events:
+                    session.delete(e)
 
             session.commit()
             return {"status": "success", "message": "Board connection removed"}

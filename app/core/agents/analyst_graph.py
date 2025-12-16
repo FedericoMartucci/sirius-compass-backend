@@ -1,6 +1,8 @@
 # app/core/agents/analyst_graph.py
 import asyncio
+import hashlib
 from datetime import datetime, timezone
+from typing import Optional
 from langgraph.graph import StateGraph, END
 from app.core.agents.state import GraphState
 from app.core.agents.nodes import analyze_activities_node, generate_report_node
@@ -104,11 +106,21 @@ async def ingest_data_node(state: GraphState):
 
     # Map Linear
     for item in lin_data:
-        try:
-            dt_source = getattr(item, "updatedAt", None) or item.createdAt
-            dt = datetime.fromisoformat(dt_source.replace("Z", "+00:00"))
-        except Exception:
-            dt = datetime.now(timezone.utc)
+        def _parse_dt(value: Optional[str]) -> Optional[datetime]:
+            if not value:
+                return None
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except Exception:
+                return None
+
+        created_at = _parse_dt(getattr(item, "createdAt", None))
+        updated_at = _parse_dt(getattr(item, "updatedAt", None)) or created_at
+        completed_at = _parse_dt(getattr(item, "completedAt", None))
+        dt = updated_at or created_at or datetime.now(timezone.utc)
+
+        cycle_starts_at = _parse_dt(getattr(item, "cycle_startsAt", None))
+        cycle_ends_at = _parse_dt(getattr(item, "cycle_endsAt", None))
         
         activities.append(UnifiedActivity(
             source_id=item.id, source_platform="linear",
@@ -121,6 +133,15 @@ async def ingest_data_node(state: GraphState):
             story_points=int(getattr(item, "estimate", 0) or 0),
             status_label=getattr(item, "state", None),
             external_key=getattr(item, "identifier", None),
+            created_at=created_at,
+            updated_at=updated_at,
+            completed_at=completed_at,
+            assignee=getattr(item, "assignee", None),
+            status_type=getattr(item, "state_type", None),
+            cycle_name=getattr(item, "cycle_name", None),
+            cycle_number=getattr(item, "cycle_number", None),
+            cycle_starts_at=cycle_starts_at,
+            cycle_ends_at=cycle_ends_at,
         ))
 
     logger.info(f"✅ Ingestion complete. Total items: {len(activities)}")
@@ -132,8 +153,12 @@ def db_writer_node(state: GraphState):
     repo_name = state["repo_name"]
     project_name = state.get("project_name") or repo_name
     activities = state.get("activities", [])
+    owner_id = state.get("user_id")
     
     if not report: return {}
+    if not owner_id:
+        logger.error("Missing user_id in graph state; cannot persist multi-tenant data safely.")
+        return {}
 
     logger.info("💾 Persisting Analysis Report to SQL...")
     session_gen = get_session()
@@ -141,9 +166,17 @@ def db_writer_node(state: GraphState):
     
     try:
         # 1. Ensure Repository Exists
-        repo_db = session.exec(select(Repository).where(Repository.name == repo_name)).first()
+        repo_db = session.exec(
+            select(Repository)
+            .where(Repository.owner_id == owner_id)
+            .where(Repository.name == repo_name)
+        ).first()
         if not repo_db:
-            repo_db = Repository(url=f"https://github.com/{repo_name}", name=repo_name)
+            repo_db = Repository(
+                url=f"https://github.com/{repo_name}",
+                name=repo_name,
+                owner_id=owner_id,
+            )
             session.add(repo_db)
             session.commit()
             session.refresh(repo_db)
@@ -219,6 +252,26 @@ def db_writer_node(state: GraphState):
             incoming_points = int(getattr(act, "story_points", 0) or 0)
             incoming_status = getattr(act, "status_label", None)
             incoming_key = getattr(act, "external_key", None)
+            incoming_assignee = getattr(act, "assignee", None) or getattr(act, "author", None)
+            incoming_status_type = getattr(act, "status_type", None)
+            incoming_created_at = getattr(act, "created_at", None) or act.timestamp
+            incoming_updated_at = getattr(act, "updated_at", None) or act.timestamp
+            incoming_completed_at = getattr(act, "completed_at", None)
+
+            fingerprint_payload = "|".join(
+                [
+                    str(incoming_key or ""),
+                    str(act.title or ""),
+                    str(act.content or ""),
+                    str(incoming_points),
+                    str(incoming_status or ""),
+                    str(incoming_status_type or ""),
+                    str(incoming_assignee or ""),
+                    str(incoming_updated_at or ""),
+                    str(incoming_completed_at or ""),
+                ]
+            )
+            incoming_fingerprint = hashlib.sha256(fingerprint_payload.encode("utf-8")).hexdigest()
 
             ticket_db = session.exec(select(Ticket).where(Ticket.source_id == act.source_id)).first()
             if not ticket_db:
@@ -231,13 +284,29 @@ def db_writer_node(state: GraphState):
                     description=act.content,
                     story_points=incoming_points,
                     status_label=incoming_status,
-                    created_at=act.timestamp,
-                    updated_at=datetime.utcnow(),
+                    created_at=incoming_created_at,
+                    updated_at=incoming_updated_at,
+                    completed_at=incoming_completed_at,
                     url=act.url,
                     raw_payload={
                         "external_key": incoming_key,
                         "status_label": incoming_status,
                         "story_points": incoming_points,
+                        "assignee": incoming_assignee,
+                        "status_type": incoming_status_type,
+                        "cycle_name": getattr(act, "cycle_name", None),
+                        "cycle_number": getattr(act, "cycle_number", None),
+                        "cycle_startsAt": (
+                            getattr(act, "cycle_starts_at", None).isoformat()
+                            if getattr(act, "cycle_starts_at", None)
+                            else None
+                        ),
+                        "cycle_endsAt": (
+                            getattr(act, "cycle_ends_at", None).isoformat()
+                            if getattr(act, "cycle_ends_at", None)
+                            else None
+                        ),
+                        "fingerprint": incoming_fingerprint,
                     },
                 )
                 session.add(ticket_db)
@@ -254,6 +323,10 @@ def db_writer_node(state: GraphState):
 
             if ticket_db.project_id != project_db.id:
                 ticket_db.project_id = project_db.id
+
+            stored_fingerprint = (ticket_db.raw_payload or {}).get("fingerprint")
+            if stored_fingerprint and stored_fingerprint == incoming_fingerprint:
+                continue
 
             if incoming_key and incoming_key != ticket_db.key:
                 session.add(
@@ -299,13 +372,50 @@ def db_writer_node(state: GraphState):
                 )
                 ticket_db.title = act.title
 
+            current_assignee = (ticket_db.raw_payload or {}).get("assignee")
+            if incoming_assignee != current_assignee:
+                session.add(
+                    TicketEvent(
+                        ticket_id=ticket_db.id,
+                        event_type="assignee_changed",
+                        from_value=str(current_assignee),
+                        to_value=str(incoming_assignee),
+                    )
+                )
+
+            if incoming_completed_at and ticket_db.completed_at != incoming_completed_at:
+                session.add(
+                    TicketEvent(
+                        ticket_id=ticket_db.id,
+                        event_type="completed_at_changed",
+                        from_value=str(ticket_db.completed_at),
+                        to_value=str(incoming_completed_at),
+                    )
+                )
+
             ticket_db.description = act.content or ticket_db.description
-            ticket_db.updated_at = datetime.utcnow()
+            ticket_db.updated_at = incoming_updated_at
+            ticket_db.completed_at = incoming_completed_at or ticket_db.completed_at
             ticket_db.url = act.url or ticket_db.url
             ticket_db.raw_payload = {
                 "external_key": ticket_db.key,
                 "status_label": ticket_db.status_label,
                 "story_points": ticket_db.story_points,
+                "assignee": incoming_assignee,
+                "status_type": incoming_status_type,
+                "cycle_name": getattr(act, "cycle_name", None),
+                "cycle_number": getattr(act, "cycle_number", None),
+                "cycle_startsAt": (
+                    getattr(act, "cycle_starts_at", None).isoformat()
+                    if getattr(act, "cycle_starts_at", None)
+                    else None
+                ),
+                "cycle_endsAt": (
+                    getattr(act, "cycle_ends_at", None).isoformat()
+                    if getattr(act, "cycle_ends_at", None)
+                    else None
+                ),
+                "fingerprint": incoming_fingerprint,
             }
 
         # Commit ingestion data before attempting to write the report.

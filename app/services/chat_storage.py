@@ -44,11 +44,8 @@ def get_or_create_thread(
     ).first()
 
     if thread:
-        if owner_id and thread.owner_id != owner_id:
-            thread.owner_id = owner_id
-            thread.updated_at = datetime.utcnow()
-            session.add(thread)
-            session.commit()
+        if owner_id and thread.owner_id and thread.owner_id != owner_id:
+            raise ValueError("Thread already belongs to a different user.")
         return thread
 
     thread = ChatThread(
@@ -71,9 +68,10 @@ def load_thread_messages(
     rows = session.exec(
         select(ChatMessage)
         .where(ChatMessage.chat_thread_id == chat_thread_id)
-        .order_by(ChatMessage.id.asc())
+        .order_by(ChatMessage.id.desc())
         .limit(limit)
     ).all()
+    rows = list(reversed(rows))
     return [(m.role, m.content) for m in rows]
 
 

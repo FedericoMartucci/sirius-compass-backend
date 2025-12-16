@@ -1,7 +1,7 @@
 import os
 import requests
 from datetime import datetime
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from pydantic import BaseModel
 from app.core.logger import get_logger
 
@@ -14,11 +14,16 @@ class LinearIssue(BaseModel):
     description: Optional[str] = None
     estimate: int = 0
     state: str
+    state_type: Optional[str] = None
     createdAt: str
     updatedAt: Optional[str] = None
     completedAt: Optional[str] = None
     url: str
     assignee: Optional[str] = None
+    cycle_name: Optional[str] = None
+    cycle_number: Optional[int] = None
+    cycle_startsAt: Optional[str] = None
+    cycle_endsAt: Optional[str] = None
 
 class LinearAdapter:
     """
@@ -44,12 +49,34 @@ class LinearAdapter:
         team_key: Optional[str] = None,
         updated_since: Optional[datetime] = None,
     ) -> List[LinearIssue]:
-        if not self._enabled: return []
+        issues, _, _ = self.fetch_issues_page(
+            limit=limit,
+            team_key=team_key,
+            updated_since=updated_since,
+            after=None,
+        )
+        return issues
+
+    def fetch_issues_page(
+        self,
+        *,
+        limit: int = 50,
+        team_key: Optional[str] = None,
+        updated_since: Optional[datetime] = None,
+        after: Optional[str] = None,
+    ) -> Tuple[List[LinearIssue], Optional[str], bool]:
+        if not self._enabled:
+            return [], None, False
 
         variable_defs = ["$limit: Int!"]
         variables: Dict[str, Any] = {"limit": limit}
 
-        filter_lines = ['state: { type: { neq: "canceled" } }']
+        if after:
+            variable_defs.append("$after: String!")
+            variables["after"] = after
+
+        # NOTE: Linear's `WorkflowStateType` is an enum; enum values must NOT be quoted.
+        filter_lines = ["state: { type: { neq: canceled } }"]
         if team_key:
             variable_defs.append("$teamKey: String!")
             variables["teamKey"] = team_key
@@ -63,7 +90,7 @@ class LinearAdapter:
         filter_block = "\n              ".join(filter_lines)
         query = f"""
         query Issues({", ".join(variable_defs)}) {{
-          issues(first: $limit, orderBy: updatedAt, filter: {{
+          issues(first: $limit{", after: $after" if after else ""}, orderBy: updatedAt, filter: {{
               {filter_block}
           }}) {{
             nodes {{
@@ -72,12 +99,17 @@ class LinearAdapter:
               title
               description
               estimate
-              state {{ name }}
+              state {{ name type }}
               createdAt
               updatedAt
               completedAt
               url
+              cycle {{ name number startsAt endsAt }}
               assignee {{ name }}
+            }}
+            pageInfo {{
+              hasNextPage
+              endCursor
             }}
           }}
         }}
@@ -89,20 +121,49 @@ class LinearAdapter:
                 headers=self._headers,
                 timeout=10
             )
-            response.raise_for_status()
-            data = response.json().get("data", {}).get("issues", {}).get("nodes", [])
+            if not response.ok:
+                body = response.text
+                if len(body) > 1500:
+                    body = body[:1500] + "... (truncated)"
+                logger.error(f"❌ Linear HTTP Error {response.status_code}: {body}")
+                response.raise_for_status()
+
+            payload = response.json() if response.content else {}
+            if payload.get("errors"):
+                logger.error(f"❌ Linear GraphQL Error: {payload.get('errors')}")
+                return [], None, False
+
+            issues_data = payload.get("data", {}).get("issues", {}) or {}
+            data = issues_data.get("nodes", []) or []
+            page_info = issues_data.get("pageInfo", {}) or {}
+            has_next = bool(page_info.get("hasNextPage"))
+            end_cursor = page_info.get("endCursor")
             
-            return [
-                LinearIssue(
-                    id=i["id"], identifier=i["identifier"], title=i["title"],
-                    description=i.get("description"), estimate=i.get("estimate") or 0,
-                    state=i["state"]["name"], createdAt=i["createdAt"],
-                    updatedAt=i.get("updatedAt"),
-                    completedAt=i.get("completedAt"),
-                    url=i["url"],
-                    assignee=(i.get("assignee") or {}).get("name"),
-                ) for i in data
-            ]
+            issues = []
+            for i in data:
+                cycle = i.get("cycle") or {}
+                issues.append(
+                    LinearIssue(
+                        id=i["id"],
+                        identifier=i["identifier"],
+                        title=i["title"],
+                        description=i.get("description"),
+                        estimate=i.get("estimate") or 0,
+                        state=(i.get("state") or {}).get("name") or "unknown",
+                        state_type=(i.get("state") or {}).get("type"),
+                        createdAt=i["createdAt"],
+                        updatedAt=i.get("updatedAt"),
+                        completedAt=i.get("completedAt"),
+                        url=i["url"],
+                        cycle_name=cycle.get("name"),
+                        cycle_number=cycle.get("number"),
+                        cycle_startsAt=cycle.get("startsAt"),
+                        cycle_endsAt=cycle.get("endsAt"),
+                        assignee=(i.get("assignee") or {}).get("name"),
+                    )
+                )
+
+            return issues, end_cursor, has_next
         except Exception as e:
             logger.error(f"❌ Linear Sync Error: {e}")
-            return []
+            return [], None, False

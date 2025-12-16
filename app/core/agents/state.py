@@ -1,5 +1,5 @@
 import operator
-from typing import List, Annotated, Optional, TypedDict
+from typing import Any, Annotated, Dict, List, Optional, TypedDict
 from langgraph.graph.message import add_messages
 from app.core.models.domain import UnifiedActivity, DeveloperReport
 
@@ -20,9 +20,11 @@ class GraphState(TypedDict):
     analysis_logs: Annotated[List[str], operator.add]
     final_report: Optional[DeveloperReport]
 
-class ChatState(TypedDict):
+class ChatState(TypedDict, total=False):
     """
     State for the Chat Graph (Conversational Process).
     Stores message history.
     """
     messages: Annotated[list, add_messages]
+    meta: Dict[str, Any]
+    skip_agent: bool

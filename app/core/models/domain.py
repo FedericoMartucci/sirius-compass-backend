@@ -54,6 +54,17 @@ class UnifiedActivity(BaseModel):
     status_label: Optional[str] = None
     external_key: Optional[str] = None
 
+    # Optional ticket/provider metadata (mainly used for Linear ingestion)
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    assignee: Optional[str] = None
+    status_type: Optional[str] = None
+    cycle_name: Optional[str] = None
+    cycle_number: Optional[int] = None
+    cycle_starts_at: Optional[datetime] = None
+    cycle_ends_at: Optional[datetime] = None
+
 class DeveloperReport(BaseModel):
     developer_name: str
     period_start: datetime

@@ -1,5 +1,6 @@
 import os
 import concurrent.futures
+from dataclasses import dataclass
 from typing import Any, List, Optional
 from datetime import datetime, timedelta, timezone
 from github import Github, GithubException
@@ -7,6 +8,16 @@ from app.core.models.domain import UnifiedActivity, ActivityType
 from app.core.logger import get_logger
 
 logger = get_logger(__name__)
+
+@dataclass(frozen=True)
+class GitHubFetchResult:
+    activities: List[UnifiedActivity]
+    commits_fetched: int
+    prs_fetched: int
+    commits_truncated: bool
+    prs_truncated: bool
+    earliest_commit_at: Optional[datetime]
+    latest_commit_at: Optional[datetime]
 
 class GitHubAdapter:
     """
@@ -54,12 +65,23 @@ class GitHubAdapter:
         return "\n\n".join(diff_summary)
 
     def fetch_recent_activity(self, repo_name: str, days: int = 90) -> List[UnifiedActivity]:
+        return self.fetch_recent_activity_with_meta(repo_name=repo_name, days=days).activities
+
+    def fetch_recent_activity_with_meta(
+        self,
+        repo_name: str,
+        days: int = 90,
+        *,
+        max_commits: Optional[int] = 300,
+        max_prs: Optional[int] = 100,
+        include_prs: bool = True,
+    ) -> GitHubFetchResult:
         """
         Fetches commits and PRs. 
         NOTE: 'days' should be large (e.g., 720 or 1100) for legacy projects.
         """
         logger.info(f"📡 Connecting to GitHub Repo: {repo_name} (Lookback: {days} days)...")
-        activities = []
+        activities: List[UnifiedActivity] = []
         
         try:
             repo = self.client.get_repo(repo_name)
@@ -74,18 +96,26 @@ class GitHubAdapter:
             commits = repo.get_commits(since=since_date, sha=default_branch)
             
             commit_count = 0
-            # We iterate without a hard limit on count, only date (controlled by API)
-            # But we add a safety ceiling (e.g. 500) to prevent infinite loops in massive repos
+            commits_truncated = False
+            earliest_commit_at: Optional[datetime] = None
+            latest_commit_at: Optional[datetime] = None
             for commit in commits:
-                commit_count += 1
-                if commit_count > 300: # Safety ceiling for MVP
-                    logger.warning("⚠️ Hit safety limit of 300 commits. Stopping fetch.")
+                if max_commits is not None and commit_count >= max_commits:
+                    commits_truncated = True
+                    logger.warning(f"⚠️ Hit safety limit of {max_commits} commits. Stopping fetch.")
                     break
+                commit_count += 1
 
                 # For very old commits, sometimes diffs are expensive. 
                 # We skip detailed diffs for commits older than 90 days to speed up legacy import
                 # unless it's critical. Here we fetch all.
                 diff_content = self._extract_diff_parallel(commit.files)
+
+                ts = commit.commit.author.date.replace(tzinfo=timezone.utc)
+                if earliest_commit_at is None or ts < earliest_commit_at:
+                    earliest_commit_at = ts
+                if latest_commit_at is None or ts > latest_commit_at:
+                    latest_commit_at = ts
 
                 activity = UnifiedActivity(
                     source_id=commit.sha,
@@ -93,16 +123,30 @@ class GitHubAdapter:
                     type=ActivityType.COMMIT,
                     author=commit.commit.author.name or "Unknown",
                     content=f"Message: {commit.commit.message}\n\nCode Diff:\n{diff_content}",
-                    timestamp=commit.commit.author.date.replace(tzinfo=timezone.utc),
+                    timestamp=ts,
                     url=commit.html_url,
                     files_changed=[f.filename for f in commit.files[:5]]
                 )
                 activities.append(activity)
 
             # --- 2. Fetch Pull Requests ---
+            pr_count = 0
+            prs_truncated = False
+            if not include_prs:
+                logger.info("Skipping PR sync (include_prs=False)")
+                logger.info(f"✅ Fetched {len(activities)} activities ({commit_count} commits, {pr_count} PRs)")
+                return GitHubFetchResult(
+                    activities=activities,
+                    commits_fetched=commit_count,
+                    prs_fetched=pr_count,
+                    commits_truncated=commits_truncated,
+                    prs_truncated=prs_truncated,
+                    earliest_commit_at=earliest_commit_at,
+                    latest_commit_at=latest_commit_at,
+                )
+
             prs = repo.get_pulls(state='all', sort='updated', direction='desc')
             pr_count = 0
-            
             for pr in prs:
                 # Manual date check as PR API doesn't support 'since' well
                 pr_date = pr.updated_at.replace(tzinfo=timezone.utc)
@@ -111,8 +155,11 @@ class GitHubAdapter:
                         break
                     continue
                 
+                if max_prs is not None and pr_count >= max_prs:
+                    prs_truncated = True
+                    logger.warning(f"⚠️ Hit safety limit of {max_prs} PRs. Stopping fetch.")
+                    break
                 pr_count += 1
-                if pr_count > 100: break # Safety ceiling
 
                 type_pr = ActivityType.PR_MERGE if pr.merged else ActivityType.PR_OPEN
                 diff_content = self._extract_diff_parallel(pr.get_files())
@@ -132,11 +179,35 @@ class GitHubAdapter:
                 activities.append(activity)
 
             logger.info(f"✅ Fetched {len(activities)} activities ({commit_count} commits, {pr_count} PRs)")
-            return activities
+            return GitHubFetchResult(
+                activities=activities,
+                commits_fetched=commit_count,
+                prs_fetched=pr_count,
+                commits_truncated=commits_truncated,
+                prs_truncated=prs_truncated,
+                earliest_commit_at=earliest_commit_at,
+                latest_commit_at=latest_commit_at,
+            )
 
         except GithubException as e:
             logger.error(f"GitHub API Error: {e.data.get('message', e)}")
-            return []
+            return GitHubFetchResult(
+                activities=[],
+                commits_fetched=0,
+                prs_fetched=0,
+                commits_truncated=False,
+                prs_truncated=False,
+                earliest_commit_at=None,
+                latest_commit_at=None,
+            )
         except Exception as e:
             logger.error(f"Unexpected Error: {e}")
-            return []
+            return GitHubFetchResult(
+                activities=[],
+                commits_fetched=0,
+                prs_fetched=0,
+                commits_truncated=False,
+                prs_truncated=False,
+                earliest_commit_at=None,
+                latest_commit_at=None,
+            )

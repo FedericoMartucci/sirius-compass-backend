@@ -232,3 +232,70 @@ class ProjectIntegration(SQLModel, table=True):
 
     created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
     updated_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+
+
+class SyncRun(SQLModel, table=True):
+    """
+    Tracks background sync runs for GitHub/Linear ingestion.
+
+    This enables progress reporting in the UI and allows the chat agent to
+    determine whether the local DB is complete or needs more data.
+    """
+
+    __table_args__ = {"extend_existing": True}
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    owner_id: str = Field(index=True)
+
+    project_id: Optional[int] = Field(default=None, foreign_key="project.id", index=True)
+    repository_id: Optional[int] = Field(default=None, foreign_key="repository.id", index=True)
+
+    provider: str = Field(index=True)  # "github" | "linear" | "all"
+    status: str = Field(index=True)  # "queued" | "running" | "completed" | "failed"
+
+    created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+    started_at: Optional[datetime] = Field(default=None, index=True)
+    finished_at: Optional[datetime] = Field(default=None, index=True)
+    updated_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+
+    progress_current: int = 0
+    progress_total: Optional[int] = None
+
+    message: Optional[str] = Field(default=None, sa_column=Column(Text))
+    details: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+
+
+class DataCoverage(SQLModel, table=True):
+    """
+    Stores high-level coverage metadata about what is currently available in the DB.
+
+    For example:
+    - provider="github", scope_type="repository", scope_id=<repo_id>
+    - provider="linear", scope_type="project", scope_id=<project_id>
+    """
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id",
+            "scope_type",
+            "scope_id",
+            "provider",
+            name="unique_owner_scope_provider",
+        ),
+        {"extend_existing": True},
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    owner_id: str = Field(index=True)
+
+    scope_type: str = Field(index=True)  # "repository" | "project"
+    scope_id: int = Field(index=True)
+    provider: str = Field(index=True)  # "github" | "linear"
+
+    earliest_at: Optional[datetime] = Field(default=None, index=True)
+    latest_at: Optional[datetime] = Field(default=None, index=True)
+    is_complete: bool = Field(default=False, index=True)
+
+    updated_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+    last_run_id: Optional[int] = Field(default=None, foreign_key="syncrun.id", index=True)
+    notes: Optional[str] = Field(default=None, sa_column=Column(Text))

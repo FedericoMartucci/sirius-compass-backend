@@ -78,3 +78,28 @@ class ReportDTO(BaseModel):
     status: str
     summary: str
     created_at: datetime
+
+
+class SyncRequest(BaseModel):
+    project_name: str = Field(..., min_length=1, max_length=200)
+    repo_name: Optional[str] = None
+
+    providers: List[str] = Field(default_factory=lambda: ["github", "linear"])
+    full_history: bool = False
+
+    max_commits: Optional[int] = Field(default=300, ge=1, le=10000)
+    max_prs: Optional[int] = Field(default=200, ge=1, le=10000)
+    max_tickets: Optional[int] = Field(default=200, ge=1, le=10000)
+
+
+class SyncRunDTO(BaseModel):
+    id: int
+    status: str
+    provider: str
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    progress_current: int = 0
+    progress_total: Optional[int] = None
+    message: Optional[str] = None
+    details: Dict[str, Any] = Field(default_factory=dict)
