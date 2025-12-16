@@ -330,6 +330,7 @@ def list_projects(user_id: str = Depends(get_user_id)):
             .join(ProjectRepository, Project.id == ProjectRepository.project_id)
             .join(Repository, ProjectRepository.repository_id == Repository.id)
             .where(Repository.owner_id == user_id)
+            .distinct()
             .order_by(Project.updated_at.desc())
         ).all()
         return [ProjectDTO(id=str(p.id), name=p.name) for p in projects]
@@ -404,6 +405,7 @@ def list_connections(
             .join(ProjectRepository, Project.id == ProjectRepository.project_id)
             .join(Repository, ProjectRepository.repository_id == Repository.id)
             .where(Repository.owner_id == user_id)
+            .distinct()
         )
         
         if project_name:
