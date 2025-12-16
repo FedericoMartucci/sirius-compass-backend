@@ -41,6 +41,7 @@ class ConnectionDTO(BaseModel):
     project: str
     status: str
     lastSync: str
+    last_error: Optional[str] = None
 
 
 class CreateConnectionRequest(BaseModel):

@@ -369,34 +369,33 @@ def list_connections(
 ):
     """List connections scoped to authenticated user's projects."""
     with Session(engine) as session:
-        active_runs = session.exec(
+        # Fetch LATEST sync run for every scope (regardless of status)
+        # We need to do this efficiently. For now, we'll fetch recent runs and filter in memory since we scope by user.
+        # A better SQL approach would be distinct on (repo_id) order by created_at desc, but SQLModel is tricky with that.
+        all_recent_runs = session.exec(
             select(SyncRun)
             .where(SyncRun.owner_id == user_id)
-            .where(SyncRun.status.in_(["queued", "running"]))
             .order_by(SyncRun.created_at.desc())
+            .limit(500)  # reasonable window
         ).all()
-        active_repo_run: dict[int, SyncRun] = {}
-        active_project_run: dict[int, SyncRun] = {}
-        for r in active_runs:
-            if r.repository_id and r.repository_id not in active_repo_run:
-                active_repo_run[r.repository_id] = r
-            if r.project_id and r.project_id not in active_project_run and r.provider in {"linear", "all"}:
-                active_project_run[r.project_id] = r
+        
+        latest_repo_run: dict[int, SyncRun] = {}
+        latest_project_run: dict[int, SyncRun] = {}
+        
+        for r in all_recent_runs:
+            if r.repository_id and r.repository_id not in latest_repo_run:
+                latest_repo_run[r.repository_id] = r
+            if r.project_id and r.project_id not in latest_project_run and r.provider in {"linear", "all"}:
+                latest_project_run[r.project_id] = r
 
-        failed_runs = session.exec(
-            select(SyncRun)
-            .where(SyncRun.owner_id == user_id)
-            .where(SyncRun.status == "failed")
-            .order_by(SyncRun.created_at.desc())
-            .limit(200)
-        ).all()
-        failed_repo_run: dict[int, SyncRun] = {}
-        failed_project_run: dict[int, SyncRun] = {}
-        for r in failed_runs:
-            if r.repository_id and r.repository_id not in failed_repo_run:
-                failed_repo_run[r.repository_id] = r
-            if r.project_id and r.project_id not in failed_project_run and r.provider in {"linear", "all"}:
-                failed_project_run[r.project_id] = r
+        def get_status_from_run(run: Optional[SyncRun]) -> tuple[str, Optional[str]]:
+            if not run:
+                return "active", None
+            if run.status in {"queued", "running"}:
+                return "syncing", None
+            if run.status == "failed":
+                return "error", run.message
+            return "active", None
 
         projects: List[Project] = []
         # Only fetch projects that have repositories owned by this user
@@ -426,18 +425,16 @@ def list_connections(
                 if not repo:
                     continue
 
+                status, error = get_status_from_run(latest_repo_run.get(repo.id or 0))
                 connections.append(
                     ConnectionDTO(
                         id=repo.id or 0,
                         type="Repository",
                         name=repo.name,
                         project=project.name,
-                        status=(
-                            "syncing"
-                            if (repo.id or 0) in active_repo_run
-                            else ("error" if (repo.id or 0) in failed_repo_run else "active")
-                        ),
+                        status=status,
                         lastSync=_format_relative_time(repo.last_synced_at),
+                        last_error=error,
                     )
                 )
 
@@ -476,18 +473,19 @@ def list_connections(
             elif integration:
                 last_sync_dt = integration.updated_at
 
+            status, error = get_status_from_run(
+                latest_project_run.get(project.id or 0)
+            )
+
             connections.append(
                 ConnectionDTO(
                     id=(integration.id if integration and integration.id else 1_000_000 + (project.id or 0)),
                     type="Board",
                     name=f"Linear ({team_key})",
                     project=project.name,
-                    status=(
-                        "syncing"
-                        if (project.id or 0) in active_project_run
-                        else ("error" if (project.id or 0) in failed_project_run else "active")
-                    ),
+                    status=status,
                     lastSync=_format_relative_time(last_sync_dt),
+                    last_error=error,
                 )
             )
 
