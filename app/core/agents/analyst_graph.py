@@ -80,15 +80,26 @@ async def ingest_data_node(state: GraphState):
             logger.warning(f"Failed to load integration credentials from DB: {e}")
 
     gh_adapter = GitHubAdapter(token=github_token)
-    lin_adapter = LinearAdapter(api_key=linear_api_key)
+    
+    # Determine if we should run Linear ingestion
+    # If user_id is present (production/multi-tenant), we MUST have found a key in DB.
+    # If user_id is missing (local dev), we allow fallback to env vars inside Adapter.
+    should_run_linear = True
+    if user_id and not linear_api_key:
+        should_run_linear = False
+        logger.info("Skipping Linear Sync: No Linear credential found for project.")
 
     # Create async tasks (wrap synchronous calls in threads)
-    task_gh = asyncio.to_thread(gh_adapter.fetch_recent_activity, repo_name, days)
-    task_lin = asyncio.to_thread(lin_adapter.fetch_recent_issues, 200, team_key=linear_team_key)
-
+    tasks = [asyncio.to_thread(gh_adapter.fetch_recent_activity, repo_name, days)]
+    
+    if should_run_linear:
+        lin_adapter = LinearAdapter(api_key=linear_api_key)
+        tasks.append(asyncio.to_thread(lin_adapter.fetch_recent_issues, 200, team_key=linear_team_key))
+    
     # Execute in parallel
-    results = await asyncio.gather(task_gh, task_lin)
-    gh_data, lin_data = results[0], results[1]
+    results = await asyncio.gather(*tasks)
+    gh_data = results[0]
+    lin_data = results[1] if len(results) > 1 else []
 
     # Map to UnifiedActivity Domain Model
     activities = []
@@ -436,7 +447,8 @@ def db_writer_node(state: GraphState):
             prs_merged=report.prs_merged,
             commits_count=commit_count,
             detected_skills=getattr(report, "detected_skills", []) or [],
-            security_alerts=False,
+            security_alerts=report.security_alerts,
+            risk_details=report.risk_details,
             feedback_summary=report.feedback_summary
         )
         session.add(db_report)

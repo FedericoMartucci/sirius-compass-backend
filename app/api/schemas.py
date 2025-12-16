@@ -78,6 +78,7 @@ class ReportDTO(BaseModel):
     repository: str
     status: str
     summary: str
+    risk_details: Optional[str] = None
     created_at: datetime
 
 

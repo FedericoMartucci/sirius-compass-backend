@@ -18,6 +18,7 @@ class GraphState(TypedDict):
     activities: Annotated[List[UnifiedActivity], operator.add]
     
     analysis_logs: Annotated[List[str], operator.add]
+    structured_analysis: Optional[Dict[str, Any]]
     final_report: Optional[DeveloperReport]
 
 class ChatState(TypedDict, total=False):
