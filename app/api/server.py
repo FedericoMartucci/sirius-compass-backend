@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 from sqlmodel import Session, select
+from sqlalchemy import false
 
 # Import Schemas from your existing file
 from app.api.schemas import (
@@ -23,11 +24,16 @@ from app.api.schemas import (
     ChatThreadDTO,
     ConnectionDTO,
     CreateConnectionRequest,
+    GuestDTO,
+    InviteGuestRequest,
+    ProjectGuestDTO,
     CreateProjectRequest,
     ProjectDTO,
     ReportDTO,
     SyncRequest,
     SyncRunDTO,
+    SaveUserSettingsPayload,
+    UserSettingsDTO,
 )
 
 from app.core.database.session import create_db_and_tables, engine
@@ -35,21 +41,25 @@ from app.core.agents.analyst_graph import build_analyst_graph
 from app.core.agents.chat_graph import build_chat_graph
 from app.core.logger import get_logger
 from app.core.security.crypto import encrypt_secret
-from app.core.security.auth import get_user_id
+from app.core.security.auth import get_current_user, get_user_id
 from app.core.streaming import TokenStreamHandler, sse_data
 from app.core.database.models import (
     AnalysisReport,
     ChatMessage,
     ChatThread,
     DataCoverage,
+    Guest,
     IntegrationCredential,
     Project,
+    ProjectGuest,
+    ProjectOwner,
     ProjectIntegration,
     ProjectRepository,
     Repository,
     SyncRun,
     Ticket,
     TicketEvent,
+    UserSettings,
 )
 from app.services.chat_storage import (
     append_message,
@@ -61,6 +71,34 @@ from app.services.sync_queue import enqueue_sync_run
 
 load_dotenv()
 logger = get_logger(__name__)
+
+
+ALLOWED_TIME_RANGES = {"7d", "30d", "90d", "180d", "365d", "all"}
+DEFAULT_TIME_RANGE = "30d"
+
+
+def _get_user_email(user: dict) -> Optional[str]:
+    email = user.get("email")
+    if isinstance(email, str):
+        email = email.strip().lower()
+    return email if email else None
+
+
+def _ensure_guest_claim(session: Session, *, user_id: str, email: Optional[str]) -> None:
+    """Best-effort: if the authenticated user has an email, link it to Guest.external_user_id."""
+    if not email:
+        return
+    guest = session.exec(select(Guest).where(Guest.email == email)).first()
+    if not guest:
+        return
+    if guest.external_user_id and guest.external_user_id != user_id:
+        return
+    if guest.external_user_id != user_id:
+        guest.external_user_id = user_id
+        if guest.accepted_at is None:
+            guest.accepted_at = datetime.utcnow()
+        session.add(guest)
+        session.commit()
 
 # --- Helper: Robust URL Parsing (Kept here as internal util) ---
 def _parse_repo_name(url_str: str) -> str:
@@ -321,15 +359,53 @@ async def chat_agent(
 
 # --- Endpoint 3: PROJECTS ---
 @app.get("/projects", response_model=List[ProjectDTO])
-def list_projects(user_id: str = Depends(get_user_id)):
-    """List projects owned by the authenticated user."""
+def list_projects(user: dict = Depends(get_current_user)):
+    """List projects accessible to the authenticated user (owner or guest)."""
+    user_id = get_user_id(user)
+    email = _get_user_email(user)
+
     with Session(engine) as session:
-        # Scope to user's projects via ProjectRepository ownership
-        projects = session.exec(
+        _ensure_guest_claim(session, user_id=user_id, email=email)
+
+        # Backfill ownership for legacy data:
+        # - projects linked to repos owned by this user
+        # - projects linked to integrations whose credentials are owned by this user
+        legacy_repo_projects = session.exec(
             select(Project)
             .join(ProjectRepository, Project.id == ProjectRepository.project_id)
             .join(Repository, ProjectRepository.repository_id == Repository.id)
+            .outerjoin(ProjectOwner, ProjectOwner.project_id == Project.id)
             .where(Repository.owner_id == user_id)
+            .where(ProjectOwner.project_id == None)  # noqa: E711
+        ).all()
+
+        legacy_linear_projects = session.exec(
+            select(Project)
+            .join(ProjectIntegration, ProjectIntegration.project_id == Project.id)
+            .join(IntegrationCredential, IntegrationCredential.id == ProjectIntegration.credential_id)
+            .outerjoin(ProjectOwner, ProjectOwner.project_id == Project.id)
+            .where(IntegrationCredential.owner_id == user_id)
+            .where(ProjectOwner.project_id == None)  # noqa: E711
+        ).all()
+
+        to_claim = {p.id for p in (legacy_repo_projects + legacy_linear_projects) if p.id is not None}
+        if to_claim:
+            for project_id in to_claim:
+                if not session.get(ProjectOwner, project_id):
+                    session.add(ProjectOwner(project_id=project_id, owner_id=user_id))
+            session.commit()
+
+        projects = session.exec(
+            select(Project)
+            .outerjoin(ProjectOwner, ProjectOwner.project_id == Project.id)
+            .outerjoin(ProjectGuest, ProjectGuest.project_id == Project.id)
+            .outerjoin(Guest, Guest.id == ProjectGuest.guest_id)
+            .where(
+                (ProjectOwner.owner_id == user_id)
+                | (Guest.external_user_id == user_id)
+                | ((Guest.email == email) if email is not None else false())
+            )
+            .distinct()
             .order_by(Project.updated_at.desc())
         ).all()
         return [ProjectDTO(id=str(p.id), name=p.name) for p in projects]
@@ -343,50 +419,189 @@ def create_project(
     """Create a new project for the authenticated user."""
     name = payload.name.strip()
     with Session(engine) as session:
-        # Check for existing project owned by this user
         existing = session.exec(
             select(Project)
-            .join(ProjectRepository, Project.id == ProjectRepository.project_id)
-            .join(Repository, ProjectRepository.repository_id == Repository.id)
+            .join(ProjectOwner, ProjectOwner.project_id == Project.id)
             .where(Project.name == name)
-            .where(Repository.owner_id == user_id)
+            .where(ProjectOwner.owner_id == user_id)
         ).first()
         if existing:
             return ProjectDTO(id=str(existing.id), name=existing.name)
+
+        # Project names are globally unique in the current schema. If a project already exists,
+        # we only allow using it if it's unclaimed or already owned by this user.
+        project = session.exec(select(Project).where(Project.name == name)).first()
+        if project:
+            owner_row = session.get(ProjectOwner, project.id)
+            if owner_row and owner_row.owner_id != user_id:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="A project with this name already exists for a different user.",
+                )
+            if not owner_row:
+                session.add(ProjectOwner(project_id=project.id, owner_id=user_id))
+                session.commit()
+            return ProjectDTO(id=str(project.id), name=project.name)
 
         project = Project(name=name, created_at=datetime.utcnow(), updated_at=datetime.utcnow())
         session.add(project)
         session.commit()
         session.refresh(project)
+        session.add(ProjectOwner(project_id=project.id, owner_id=user_id))
+        session.commit()
         return ProjectDTO(id=str(project.id), name=project.name)
+
+
+# --- Endpoint 3.5: USER SETTINGS ---
+def _coerce_project_id(value: Optional[str]) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="default_project_id must be a stringified integer or null")
+
+
+def _normalize_time_range(value: Optional[str]) -> str:
+    if value is None:
+        return DEFAULT_TIME_RANGE
+    if not isinstance(value, str):
+        raise HTTPException(status_code=400, detail="default_time_range must be a string")
+    value = value.strip()
+    if not value:
+        return DEFAULT_TIME_RANGE
+    if value not in ALLOWED_TIME_RANGES:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Invalid default_time_range",
+                "allowed": sorted(ALLOWED_TIME_RANGES),
+            },
+        )
+    return value
+
+
+def _project_accessible(
+    session: Session,
+    *,
+    project_id: int,
+    user_id: str,
+    email: Optional[str],
+) -> bool:
+    row = session.exec(
+        select(Project.id)
+        .outerjoin(ProjectOwner, ProjectOwner.project_id == Project.id)
+        .outerjoin(ProjectGuest, ProjectGuest.project_id == Project.id)
+        .outerjoin(Guest, Guest.id == ProjectGuest.guest_id)
+        .where(Project.id == project_id)
+        .where(
+            (ProjectOwner.owner_id == user_id)
+            | (Guest.external_user_id == user_id)
+            | ((Guest.email == email) if email is not None else false())
+        )
+        .limit(1)
+    ).first()
+    return row is not None
+
+
+@app.get("/user-settings", response_model=UserSettingsDTO)
+def get_user_settings(user: dict = Depends(get_current_user)):
+    """Return authenticated user's settings (or defaults if none exist)."""
+    user_id = get_user_id(user)
+    email = _get_user_email(user)
+
+    with Session(engine) as session:
+        settings = session.exec(select(UserSettings).where(UserSettings.user_id == user_id)).first()
+        if not settings:
+            return UserSettingsDTO(default_project_id=None, default_time_range=DEFAULT_TIME_RANGE)
+
+        # If stored project no longer exists / is not accessible, return null (and clean up).
+        default_project_id: Optional[str] = None
+        if settings.default_project_id is not None:
+            if _project_accessible(
+                session,
+                project_id=settings.default_project_id,
+                user_id=user_id,
+                email=email,
+            ):
+                default_project_id = str(settings.default_project_id)
+            else:
+                settings.default_project_id = None
+                settings.updated_at = datetime.utcnow()
+                session.add(settings)
+                session.commit()
+
+        return UserSettingsDTO(
+            default_project_id=default_project_id,
+            default_time_range=settings.default_time_range or DEFAULT_TIME_RANGE,
+        )
+
+
+@app.put("/user-settings", response_model=UserSettingsDTO)
+def save_user_settings(
+    payload: SaveUserSettingsPayload,
+    user: dict = Depends(get_current_user),
+):
+    """Upsert authenticated user's settings."""
+    user_id = get_user_id(user)
+    email = _get_user_email(user)
+
+    requested_project_id = _coerce_project_id(payload.default_project_id)
+    requested_time_range = payload.default_time_range
+
+    with Session(engine) as session:
+        settings = session.exec(select(UserSettings).where(UserSettings.user_id == user_id)).first()
+        if not settings:
+            settings = UserSettings(
+                user_id=user_id,
+                default_project_id=None,
+                default_time_range=DEFAULT_TIME_RANGE,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            )
+
+        if requested_project_id is not None:
+            if not _project_accessible(
+                session,
+                project_id=requested_project_id,
+                user_id=user_id,
+                email=email,
+            ):
+                raise HTTPException(status_code=400, detail="default_project_id is not accessible for this user")
+            settings.default_project_id = requested_project_id
+        elif payload.default_project_id is not None:
+            # Explicit null/empty clears.
+            settings.default_project_id = None
+
+        if requested_time_range is not None:
+            settings.default_time_range = _normalize_time_range(requested_time_range)
+
+        settings.updated_at = datetime.utcnow()
+        session.add(settings)
+        session.commit()
+        session.refresh(settings)
+
+        return UserSettingsDTO(
+            default_project_id=str(settings.default_project_id) if settings.default_project_id is not None else None,
+            default_time_range=settings.default_time_range or DEFAULT_TIME_RANGE,
+        )
 
 
 # --- Endpoint 4: CONNECTIONS (Integrations) ---
 @app.get("/connections", response_model=List[ConnectionDTO])
 def list_connections(
     project_name: Optional[str] = Query(default=None),
-    user_id: str = Depends(get_user_id)
+    user: dict = Depends(get_current_user)
 ):
     """List connections scoped to authenticated user's projects."""
+    user_id = get_user_id(user)
+    email = _get_user_email(user)
     with Session(engine) as session:
-        # Fetch LATEST sync run for every scope (regardless of status)
-        # We need to do this efficiently. For now, we'll fetch recent runs and filter in memory since we scope by user.
-        # A better SQL approach would be distinct on (repo_id) order by created_at desc, but SQLModel is tricky with that.
-        all_recent_runs = session.exec(
-            select(SyncRun)
-            .where(SyncRun.owner_id == user_id)
-            .order_by(SyncRun.created_at.desc())
-            .limit(500)  # reasonable window
-        ).all()
-        
-        latest_repo_run: dict[int, SyncRun] = {}
-        latest_project_run: dict[int, SyncRun] = {}
-        
-        for r in all_recent_runs:
-            if r.repository_id and r.repository_id not in latest_repo_run:
-                latest_repo_run[r.repository_id] = r
-            if r.project_id and r.project_id not in latest_project_run and r.provider in {"linear", "all"}:
-                latest_project_run[r.project_id] = r
+        _ensure_guest_claim(session, user_id=user_id, email=email)
 
         def get_status_from_run(run: Optional[SyncRun]) -> tuple[str, Optional[str]]:
             if not run:
@@ -398,12 +613,18 @@ def list_connections(
             return "active", None
 
         projects: List[Project] = []
-        # Only fetch projects that have repositories owned by this user
+        # Fetch projects accessible to this user (owner or guest), even if they have no repositories yet.
         base_query = (
             select(Project)
-            .join(ProjectRepository, Project.id == ProjectRepository.project_id)
-            .join(Repository, ProjectRepository.repository_id == Repository.id)
-            .where(Repository.owner_id == user_id)
+            .outerjoin(ProjectOwner, ProjectOwner.project_id == Project.id)
+            .outerjoin(ProjectGuest, ProjectGuest.project_id == Project.id)
+            .outerjoin(Guest, Guest.id == ProjectGuest.guest_id)
+            .where(
+                (ProjectOwner.owner_id == user_id)
+                | (Guest.external_user_id == user_id)
+                | ((Guest.email == email) if email is not None else false())
+            )
+            .distinct()
         )
         
         if project_name:
@@ -415,11 +636,39 @@ def list_connections(
 
         connections: List[ConnectionDTO] = []
 
+        project_ids = [p.id for p in projects if p.id is not None]
+        repo_links: list[ProjectRepository] = []
+        repo_ids: list[int] = []
+        if project_ids:
+            repo_links = session.exec(
+                select(ProjectRepository).where(ProjectRepository.project_id.in_(project_ids))
+            ).all()
+            repo_ids = [l.repository_id for l in repo_links if l.repository_id is not None]
+
+        # Fetch latest sync runs for these scopes (regardless of who owns the run).
+        # This makes connection status useful for guests too.
+        latest_repo_run: dict[int, SyncRun] = {}
+        latest_project_run: dict[int, SyncRun] = {}
+        if project_ids or repo_ids:
+            all_recent_runs = session.exec(
+                select(SyncRun)
+                .where(
+                    (SyncRun.project_id.in_(project_ids) if project_ids else false())
+                    | (SyncRun.repository_id.in_(repo_ids) if repo_ids else false())
+                )
+                .order_by(SyncRun.created_at.desc())
+                .limit(500)
+            ).all()
+
+            for r in all_recent_runs:
+                if r.repository_id and r.repository_id not in latest_repo_run:
+                    latest_repo_run[r.repository_id] = r
+                if r.project_id and r.project_id not in latest_project_run and r.provider in {"linear", "all"}:
+                    latest_project_run[r.project_id] = r
+
         # Repository connections
         for project in projects:
-            links = session.exec(
-                select(ProjectRepository).where(ProjectRepository.project_id == project.id)
-            ).all()
+            links = [l for l in repo_links if l.project_id == project.id]
             for link in links:
                 repo = session.get(Repository, link.repository_id)
                 if not repo:
@@ -500,6 +749,142 @@ def list_connections(
         return connections
 
 
+@app.post("/projects/guests", response_model=ProjectGuestDTO)
+def invite_guest_to_project(
+    payload: InviteGuestRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Invite a guest (by email) to a project. Only the project owner can invite."""
+    user_id = get_user_id(user)
+    email = (payload.email or "").strip().lower()
+    role = (payload.role or "viewer").strip().lower()
+    if role not in {"viewer", "editor"}:
+        raise HTTPException(status_code=400, detail="role must be 'viewer' or 'editor'")
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Invalid email")
+
+    with Session(engine) as session:
+        project: Optional[Project] = None
+        if payload.project_id is not None:
+            project = session.get(Project, payload.project_id)
+        elif payload.project_name:
+            project = session.exec(select(Project).where(Project.name == payload.project_name.strip())).first()
+        else:
+            raise HTTPException(status_code=400, detail="project_id or project_name is required")
+
+        if not project or project.id is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        owner_row = session.get(ProjectOwner, project.id)
+        if not owner_row or owner_row.owner_id != user_id:
+            raise HTTPException(status_code=403, detail="Only the project owner can invite guests")
+
+        guest = session.exec(select(Guest).where(Guest.email == email)).first()
+        if not guest:
+            guest = Guest(email=email, invited_by_owner_id=user_id)
+            session.add(guest)
+            session.commit()
+            session.refresh(guest)
+
+        link = session.exec(
+            select(ProjectGuest)
+            .where(ProjectGuest.project_id == project.id)
+            .where(ProjectGuest.guest_id == guest.id)
+        ).first()
+        if not link:
+            link = ProjectGuest(project_id=project.id, guest_id=guest.id or 0, role=role)
+        else:
+            link.role = role
+        session.add(link)
+        session.commit()
+        session.refresh(link)
+
+        return ProjectGuestDTO(
+            project_id=project.id,
+            guest=GuestDTO(id=guest.id or 0, email=guest.email),
+            role=link.role,
+            created_at=link.created_at,
+        )
+
+
+@app.get("/projects/{project_id}/guests", response_model=List[ProjectGuestDTO])
+def list_project_guests(
+    project_id: int,
+    user: dict = Depends(get_current_user),
+):
+    """List guests for a project. Owner or project guests may view."""
+    user_id = get_user_id(user)
+    email = _get_user_email(user)
+
+    with Session(engine) as session:
+        _ensure_guest_claim(session, user_id=user_id, email=email)
+
+        project = session.get(Project, project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        is_owner = (session.get(ProjectOwner, project_id) or None)
+        owner_ok = bool(is_owner and is_owner.owner_id == user_id)
+
+        guest_ok = False
+        if not owner_ok:
+            guest_ok = session.exec(
+                select(ProjectGuest)
+                .join(Guest, Guest.id == ProjectGuest.guest_id)
+                .where(ProjectGuest.project_id == project_id)
+                .where(
+                    (Guest.external_user_id == user_id)
+                    | ((Guest.email == email) if email is not None else false())
+                )
+            ).first() is not None
+
+        if not owner_ok and not guest_ok:
+            raise HTTPException(status_code=403, detail="Not authorized")
+
+        rows = session.exec(
+            select(ProjectGuest, Guest)
+            .join(Guest, Guest.id == ProjectGuest.guest_id)
+            .where(ProjectGuest.project_id == project_id)
+            .order_by(ProjectGuest.created_at.desc())
+        ).all()
+
+        return [
+            ProjectGuestDTO(
+                project_id=project_id,
+                guest=GuestDTO(id=g.id or 0, email=g.email),
+                role=pg.role,
+                created_at=pg.created_at,
+            )
+            for (pg, g) in rows
+        ]
+
+
+@app.delete("/projects/{project_id}/guests/{guest_id}")
+def remove_project_guest(
+    project_id: int,
+    guest_id: int,
+    user: dict = Depends(get_current_user),
+):
+    """Remove a guest from a project. Only the project owner can remove."""
+    user_id = get_user_id(user)
+    with Session(engine) as session:
+        owner_row = session.get(ProjectOwner, project_id)
+        if not owner_row or owner_row.owner_id != user_id:
+            raise HTTPException(status_code=403, detail="Only the project owner can remove guests")
+
+        link = session.exec(
+            select(ProjectGuest)
+            .where(ProjectGuest.project_id == project_id)
+            .where(ProjectGuest.guest_id == guest_id)
+        ).first()
+        if not link:
+            raise HTTPException(status_code=404, detail="Guest link not found")
+
+        session.delete(link)
+        session.commit()
+        return {"status": "success"}
+
+
 @app.post("/connections", response_model=ConnectionDTO)
 def create_connection(
     payload: CreateConnectionRequest,
@@ -510,12 +895,34 @@ def create_connection(
     project_name = payload.project_name.strip()
 
     with Session(engine) as session:
-        project = session.exec(select(Project).where(Project.name == project_name)).first()
+        project = session.exec(
+            select(Project)
+            .join(ProjectOwner, ProjectOwner.project_id == Project.id)
+            .where(Project.name == project_name)
+            .where(ProjectOwner.owner_id == user_id)
+        ).first()
+
         if not project:
-            project = Project(name=project_name, created_at=datetime.utcnow(), updated_at=datetime.utcnow())
-            session.add(project)
-            session.commit()
-            session.refresh(project)
+            # If a project exists with the same name but is owned by someone else, block.
+            existing_by_name = session.exec(select(Project).where(Project.name == project_name)).first()
+            if existing_by_name:
+                owner_row = session.get(ProjectOwner, existing_by_name.id)
+                if owner_row and owner_row.owner_id != user_id:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="A project with this name already exists for a different user.",
+                    )
+                project = existing_by_name
+            else:
+                project = Project(name=project_name, created_at=datetime.utcnow(), updated_at=datetime.utcnow())
+                session.add(project)
+                session.commit()
+                session.refresh(project)
+
+            # Ensure ownership row exists for this user.
+            if not session.get(ProjectOwner, project.id):
+                session.add(ProjectOwner(project_id=project.id, owner_id=user_id))
+                session.commit()
 
         if connection_type in {"repository", "repo", "github"}:
             if not payload.repo_url:
@@ -674,16 +1081,21 @@ async def start_sync(
             detail="repo_name is required for GitHub sync (expected 'owner/repo' or a GitHub URL).",
         )
 
-    run = enqueue_sync_run(
-        owner_id=user_id,
-        project_name=project_name,
-        repo_name=repo_name,
-        providers=providers,
-        full_history=payload.full_history,
-        max_commits=payload.max_commits,
-        max_prs=payload.max_prs,
-        max_tickets=payload.max_tickets,
-    )
+    # Note: enqueue_sync_run may raise ValueError on ownership/name conflicts.
+    # We translate that into a user-facing 409.
+    try:
+        run = enqueue_sync_run(
+            owner_id=user_id,
+            project_name=project_name,
+            repo_name=repo_name,
+            providers=providers,
+            full_history=payload.full_history,
+            max_commits=payload.max_commits,
+            max_prs=payload.max_prs,
+            max_tickets=payload.max_tickets,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
 
     return SyncRunDTO(
         id=run.id or 0,

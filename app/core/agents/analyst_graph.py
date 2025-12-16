@@ -15,6 +15,7 @@ from app.core.database.models import (
     AnalysisReport,
     IntegrationCredential,
     Project,
+    ProjectOwner,
     ProjectIntegration,
     ProjectRepository,
     Repository,
@@ -57,7 +58,12 @@ async def ingest_data_node(state: GraphState):
                 if github_cred:
                     github_token = decrypt_secret(github_cred.encrypted_secret)
 
-                project_db = session.exec(select(Project).where(Project.name == project_name)).first()
+                project_db = session.exec(
+                    select(Project)
+                    .join(ProjectOwner, ProjectOwner.project_id == Project.id)
+                    .where(Project.name == project_name)
+                    .where(ProjectOwner.owner_id == user_id)
+                ).first()
                 if project_db:
                     linear_integration = session.exec(
                         select(ProjectIntegration)
@@ -196,12 +202,29 @@ def db_writer_node(state: GraphState):
         repo_db.last_analyzed = datetime.utcnow()
 
         # 2. Ensure Project Exists and link Repository <-> Project
-        project_db = session.exec(select(Project).where(Project.name == project_name)).first()
+        project_db = session.exec(
+            select(Project)
+            .join(ProjectOwner, ProjectOwner.project_id == Project.id)
+            .where(Project.name == project_name)
+            .where(ProjectOwner.owner_id == owner_id)
+        ).first()
         if not project_db:
-            project_db = Project(name=project_name)
-            session.add(project_db)
-            session.commit()
-            session.refresh(project_db)
+            existing_by_name = session.exec(select(Project).where(Project.name == project_name)).first()
+            if existing_by_name:
+                owner_row = session.get(ProjectOwner, existing_by_name.id)
+                if owner_row and owner_row.owner_id != owner_id:
+                    logger.error("Project name already exists for a different user; cannot persist analysis safely.")
+                    return {}
+                project_db = existing_by_name
+            else:
+                project_db = Project(name=project_name)
+                session.add(project_db)
+                session.commit()
+                session.refresh(project_db)
+
+            if not session.get(ProjectOwner, project_db.id):
+                session.add(ProjectOwner(project_id=project_db.id, owner_id=owner_id))
+                session.commit()
 
         project_repo_link = session.exec(
             select(ProjectRepository).where(
