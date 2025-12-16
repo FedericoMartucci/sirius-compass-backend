@@ -74,3 +74,5 @@ class DeveloperReport(BaseModel):
     quality_score: int
     feedback_summary: str
     detected_skills: List[str]
+    security_alerts: bool = False
+    risk_details: Optional[str] = None

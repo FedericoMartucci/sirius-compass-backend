@@ -950,6 +950,7 @@ def list_reports(
                     repository=repo_name,
                     status=status,
                     summary=summary,
+                    risk_details=r.risk_details,
                     created_at=created,
                 )
             )

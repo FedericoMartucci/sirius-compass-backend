@@ -64,6 +64,7 @@ class AnalysisReport(SQLModel, table=True):
     prs_merged: int
     commits_count: int = 0
     security_alerts: bool = False
+    risk_details: Optional[str] = Field(default=None, sa_column=Column(Text))
     
     # The Summary used by the Chatbot
     detected_skills: List[str] = Field(default_factory=list, sa_column=Column(JSON))
