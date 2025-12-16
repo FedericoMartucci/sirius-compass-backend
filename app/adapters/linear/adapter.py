@@ -76,7 +76,8 @@ class LinearAdapter:
             variables["after"] = after
 
         # NOTE: Linear's `WorkflowStateType` is an enum; enum values must NOT be quoted.
-        filter_lines = ["state: { type: { neq: canceled } }"]
+        # Actually, the error `String cannot represent a non string value: canceled` suggests it WANTS a string.
+        filter_lines = ['state: { type: { neq: "canceled" } }']
         if team_key:
             variable_defs.append("$teamKey: String!")
             variables["teamKey"] = team_key
@@ -166,4 +167,4 @@ class LinearAdapter:
             return issues, end_cursor, has_next
         except Exception as e:
             logger.error(f"❌ Linear Sync Error: {e}")
-            return [], None, False
+            raise e
