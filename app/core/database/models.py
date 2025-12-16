@@ -90,6 +90,23 @@ class Project(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=datetime.utcnow, index=True)
 
 
+class ProjectOwner(SQLModel, table=True):
+    """Maps a Project to its owning user (multi-tenancy).
+
+    We keep ownership in a separate table to avoid relying on ProjectRepository links,
+    so projects can exist before any repository is connected.
+    """
+
+    __table_args__ = (
+        UniqueConstraint("owner_id", "project_id", name="unique_owner_project"),
+        {"extend_existing": True},
+    )
+
+    project_id: int = Field(foreign_key="project.id", primary_key=True)
+    owner_id: str = Field(index=True)
+    created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+
+
 class ProjectRepository(SQLModel, table=True):
     """
     Many-to-many relationship between Project and Repository.

@@ -6,7 +6,7 @@ from typing import Optional
 
 from sqlmodel import Session, select
 
-from app.core.database.models import Project, ProjectRepository, Repository, SyncRun
+from app.core.database.models import Project, ProjectOwner, ProjectRepository, Repository, SyncRun
 from app.core.database.session import engine
 from app.services.sync_orchestrator import SyncOrchestrator
 
@@ -32,12 +32,29 @@ def enqueue_sync_run(
     provider_label = "all" if len(providers) > 1 else (providers[0] if providers else "all")
 
     with Session(engine) as session:
-        project = session.exec(select(Project).where(Project.name == project_name)).first()
+        project = session.exec(
+            select(Project)
+            .join(ProjectOwner, ProjectOwner.project_id == Project.id)
+            .where(Project.name == project_name)
+            .where(ProjectOwner.owner_id == owner_id)
+        ).first()
         if not project:
-            project = Project(name=project_name, created_at=datetime.utcnow(), updated_at=datetime.utcnow())
-            session.add(project)
-            session.commit()
-            session.refresh(project)
+            # Fall back to existing-by-name (global uniqueness) and claim if unowned.
+            existing_by_name = session.exec(select(Project).where(Project.name == project_name)).first()
+            if existing_by_name:
+                owner_row = session.get(ProjectOwner, existing_by_name.id)
+                if owner_row and owner_row.owner_id != owner_id:
+                    raise ValueError("Project name already exists for a different user.")
+                project = existing_by_name
+            else:
+                project = Project(name=project_name, created_at=datetime.utcnow(), updated_at=datetime.utcnow())
+                session.add(project)
+                session.commit()
+                session.refresh(project)
+
+            if not session.get(ProjectOwner, project.id):
+                session.add(ProjectOwner(project_id=project.id, owner_id=owner_id))
+                session.commit()
 
         repo = None
         if repo_name:

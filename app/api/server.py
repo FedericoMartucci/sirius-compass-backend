@@ -44,6 +44,7 @@ from app.core.database.models import (
     DataCoverage,
     IntegrationCredential,
     Project,
+    ProjectOwner,
     ProjectIntegration,
     ProjectRepository,
     Repository,
@@ -324,12 +325,38 @@ async def chat_agent(
 def list_projects(user_id: str = Depends(get_user_id)):
     """List projects owned by the authenticated user."""
     with Session(engine) as session:
-        # Scope to user's projects via ProjectRepository ownership
-        projects = session.exec(
+        # Backfill ownership for legacy data:
+        # - projects linked to repos owned by this user
+        # - projects linked to integrations whose credentials are owned by this user
+        legacy_repo_projects = session.exec(
             select(Project)
             .join(ProjectRepository, Project.id == ProjectRepository.project_id)
             .join(Repository, ProjectRepository.repository_id == Repository.id)
+            .outerjoin(ProjectOwner, ProjectOwner.project_id == Project.id)
             .where(Repository.owner_id == user_id)
+            .where(ProjectOwner.project_id == None)  # noqa: E711
+        ).all()
+
+        legacy_linear_projects = session.exec(
+            select(Project)
+            .join(ProjectIntegration, ProjectIntegration.project_id == Project.id)
+            .join(IntegrationCredential, IntegrationCredential.id == ProjectIntegration.credential_id)
+            .outerjoin(ProjectOwner, ProjectOwner.project_id == Project.id)
+            .where(IntegrationCredential.owner_id == user_id)
+            .where(ProjectOwner.project_id == None)  # noqa: E711
+        ).all()
+
+        to_claim = {p.id for p in (legacy_repo_projects + legacy_linear_projects) if p.id is not None}
+        if to_claim:
+            for project_id in to_claim:
+                if not session.get(ProjectOwner, project_id):
+                    session.add(ProjectOwner(project_id=project_id, owner_id=user_id))
+            session.commit()
+
+        projects = session.exec(
+            select(Project)
+            .join(ProjectOwner, ProjectOwner.project_id == Project.id)
+            .where(ProjectOwner.owner_id == user_id)
             .order_by(Project.updated_at.desc())
         ).all()
         return [ProjectDTO(id=str(p.id), name=p.name) for p in projects]
@@ -343,21 +370,36 @@ def create_project(
     """Create a new project for the authenticated user."""
     name = payload.name.strip()
     with Session(engine) as session:
-        # Check for existing project owned by this user
         existing = session.exec(
             select(Project)
-            .join(ProjectRepository, Project.id == ProjectRepository.project_id)
-            .join(Repository, ProjectRepository.repository_id == Repository.id)
+            .join(ProjectOwner, ProjectOwner.project_id == Project.id)
             .where(Project.name == name)
-            .where(Repository.owner_id == user_id)
+            .where(ProjectOwner.owner_id == user_id)
         ).first()
         if existing:
             return ProjectDTO(id=str(existing.id), name=existing.name)
+
+        # Project names are globally unique in the current schema. If a project already exists,
+        # we only allow using it if it's unclaimed or already owned by this user.
+        project = session.exec(select(Project).where(Project.name == name)).first()
+        if project:
+            owner_row = session.get(ProjectOwner, project.id)
+            if owner_row and owner_row.owner_id != user_id:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="A project with this name already exists for a different user.",
+                )
+            if not owner_row:
+                session.add(ProjectOwner(project_id=project.id, owner_id=user_id))
+                session.commit()
+            return ProjectDTO(id=str(project.id), name=project.name)
 
         project = Project(name=name, created_at=datetime.utcnow(), updated_at=datetime.utcnow())
         session.add(project)
         session.commit()
         session.refresh(project)
+        session.add(ProjectOwner(project_id=project.id, owner_id=user_id))
+        session.commit()
         return ProjectDTO(id=str(project.id), name=project.name)
 
 
@@ -398,12 +440,11 @@ def list_connections(
             return "active", None
 
         projects: List[Project] = []
-        # Only fetch projects that have repositories owned by this user
+        # Fetch projects owned by this user even if they have no repositories yet.
         base_query = (
             select(Project)
-            .join(ProjectRepository, Project.id == ProjectRepository.project_id)
-            .join(Repository, ProjectRepository.repository_id == Repository.id)
-            .where(Repository.owner_id == user_id)
+            .join(ProjectOwner, ProjectOwner.project_id == Project.id)
+            .where(ProjectOwner.owner_id == user_id)
         )
         
         if project_name:
@@ -422,7 +463,7 @@ def list_connections(
             ).all()
             for link in links:
                 repo = session.get(Repository, link.repository_id)
-                if not repo:
+                if not repo or repo.owner_id != user_id:
                     continue
 
                 run = latest_repo_run.get(repo.id or 0)
@@ -510,12 +551,34 @@ def create_connection(
     project_name = payload.project_name.strip()
 
     with Session(engine) as session:
-        project = session.exec(select(Project).where(Project.name == project_name)).first()
+        project = session.exec(
+            select(Project)
+            .join(ProjectOwner, ProjectOwner.project_id == Project.id)
+            .where(Project.name == project_name)
+            .where(ProjectOwner.owner_id == user_id)
+        ).first()
+
         if not project:
-            project = Project(name=project_name, created_at=datetime.utcnow(), updated_at=datetime.utcnow())
-            session.add(project)
-            session.commit()
-            session.refresh(project)
+            # If a project exists with the same name but is owned by someone else, block.
+            existing_by_name = session.exec(select(Project).where(Project.name == project_name)).first()
+            if existing_by_name:
+                owner_row = session.get(ProjectOwner, existing_by_name.id)
+                if owner_row and owner_row.owner_id != user_id:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="A project with this name already exists for a different user.",
+                    )
+                project = existing_by_name
+            else:
+                project = Project(name=project_name, created_at=datetime.utcnow(), updated_at=datetime.utcnow())
+                session.add(project)
+                session.commit()
+                session.refresh(project)
+
+            # Ensure ownership row exists for this user.
+            if not session.get(ProjectOwner, project.id):
+                session.add(ProjectOwner(project_id=project.id, owner_id=user_id))
+                session.commit()
 
         if connection_type in {"repository", "repo", "github"}:
             if not payload.repo_url:
@@ -674,16 +737,21 @@ async def start_sync(
             detail="repo_name is required for GitHub sync (expected 'owner/repo' or a GitHub URL).",
         )
 
-    run = enqueue_sync_run(
-        owner_id=user_id,
-        project_name=project_name,
-        repo_name=repo_name,
-        providers=providers,
-        full_history=payload.full_history,
-        max_commits=payload.max_commits,
-        max_prs=payload.max_prs,
-        max_tickets=payload.max_tickets,
-    )
+    # Note: enqueue_sync_run may raise ValueError on ownership/name conflicts.
+    # We translate that into a user-facing 409.
+    try:
+        run = enqueue_sync_run(
+            owner_id=user_id,
+            project_name=project_name,
+            repo_name=repo_name,
+            providers=providers,
+            full_history=payload.full_history,
+            max_commits=payload.max_commits,
+            max_prs=payload.max_prs,
+            max_tickets=payload.max_tickets,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
 
     return SyncRunDTO(
         id=run.id or 0,

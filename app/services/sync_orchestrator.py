@@ -13,6 +13,7 @@ from app.core.database.models import (
     DataCoverage,
     IntegrationCredential,
     Project,
+    ProjectOwner,
     ProjectIntegration,
     ProjectRepository,
     Repository,
@@ -224,12 +225,29 @@ class SyncOrchestrator:
 
     def _ensure_project(self, project_name: str) -> int:
         with Session(engine) as session:
-            project = session.exec(select(Project).where(Project.name == project_name)).first()
+            project = session.exec(
+                select(Project)
+                .join(ProjectOwner, ProjectOwner.project_id == Project.id)
+                .where(Project.name == project_name)
+                .where(ProjectOwner.owner_id == self.owner_id)
+            ).first()
+
             if not project:
-                project = Project(name=project_name, created_at=datetime.utcnow(), updated_at=datetime.utcnow())
-                session.add(project)
-                session.commit()
-                session.refresh(project)
+                existing_by_name = session.exec(select(Project).where(Project.name == project_name)).first()
+                if existing_by_name:
+                    owner_row = session.get(ProjectOwner, existing_by_name.id)
+                    if owner_row and owner_row.owner_id != self.owner_id:
+                        raise ValueError("Project name already exists for a different user.")
+                    project = existing_by_name
+                else:
+                    project = Project(name=project_name, created_at=datetime.utcnow(), updated_at=datetime.utcnow())
+                    session.add(project)
+                    session.commit()
+                    session.refresh(project)
+
+                if not session.get(ProjectOwner, project.id):
+                    session.add(ProjectOwner(project_id=project.id, owner_id=self.owner_id))
+                    session.commit()
             return project.id or 0
 
     def _ensure_repository(self, repo_name: str, project_id: int) -> int:

@@ -38,6 +38,7 @@ from app.core.database.models import (
     DataCoverage,
     IntegrationCredential,
     Project,
+    ProjectOwner,
     ProjectIntegration,
     ProjectRepository,
     Repository,
@@ -275,7 +276,12 @@ def build_chat_graph():
                         "message": "No tengo credenciales de GitHub configuradas. Conectá GitHub en Connections para poder sincronizar.",
                     }
 
-            project = session.exec(select(Project).where(Project.name == project_name)).first()
+            project = session.exec(
+                select(Project)
+                .join(ProjectOwner, ProjectOwner.project_id == Project.id)
+                .where(Project.name == project_name)
+                .where(ProjectOwner.owner_id == owner_id)
+            ).first()
             if not project:
                 return {
                     "type": "missing_project",
